@@ -646,6 +646,7 @@ export const updateProduct = async (req, res) => {
 
 export const updateProfile = async (req, res) => {
   try {
+    console.log("Reach 1")
     const sellerId = req.user?.userId;
     const { INR, DXB, name, phone, companyName, address, city, state, country, pincode, gstNumber, panNumber } = req.body;
 

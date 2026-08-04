@@ -28,6 +28,7 @@ const SellerRouter = express.Router();
 
 const sellerAuthMiddleware = async (req, res, next) => {
   try {
+    console.log("=== SELLER AUTH MIDDLEWARE ===");
     const token = req.headers.authorization?.split(' ')[1];
     if (!token) {
       return res.status(401).json({ success: false, message: "Authentication required" });
@@ -126,7 +127,7 @@ SellerRouter.post("/register", SignUp);
 SellerRouter.post("/login", login);
 SellerRouter.put('/reset-password', sellerAuthMiddleware, resetPassword);
 SellerRouter.get('/profile/:id', getSellerProfile);
-SellerRouter.put('/update-profile', sellerAuthMiddleware, profileImageUpload.single('profileImage'), updateProfile);
+SellerRouter.put('/update-profile/:id', sellerAuthMiddleware, profileImageUpload.single('profileImage'), updateProfile);
 SellerRouter.post("/add-product", sellerAuthMiddleware, handleProductMedia, addProduct);
 SellerRouter.get("/get-products/:id", getProducts);
 SellerRouter.put("/edit-product/:id", sellerAuthMiddleware, handleProductMedia, updateProduct);

@@ -57,6 +57,8 @@ import {
     trackOrder
 } from "../Controller/OrderController.js";
 
+import { razorpayWebhook } from "../Controller/WebhookController.js";
+
 import { authMiddleware } from "../Middleware/Auth.js";
 
 dotenv.config();
@@ -108,6 +110,10 @@ UserRoute.post("/order/:orderId/cancel-item", authMiddleware, cancelOrderItem);
 UserRoute.post("/order/:orderId/return", authMiddleware, requestReturn);
 UserRoute.get("/order/:orderId/track", authMiddleware, trackOrder);
 UserRoute.post("/order/update-status", authMiddleware, updateOrderStatus);
+
+// Razorpay server-to-server webhook. No authMiddleware — Razorpay's servers call
+// this directly with no user session, verified instead via x-razorpay-signature.
+UserRoute.post("/webhook/razorpay", razorpayWebhook);
 
 UserRoute.get("/clear-cache", clearCacheHandler);
 

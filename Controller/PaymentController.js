@@ -125,11 +125,19 @@ export const verifyPayment = async (req, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature, orderId } = req.body;
 
-    const sha = crypto.createHmac("sha256", process.env.RAZORPAY_KEY_SECRET);
-    sha.update(`${razorpay_order_id}|${razorpay_payment_id}`);
-    const digest = sha.digest("hex");
+    const generatedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
 
-    if (digest !== razorpay_signature) {
+    const generatedBuffer = Buffer.from(generatedSignature);
+    const receivedBuffer = Buffer.from(razorpay_signature || "");
+
+    const isValid =
+      generatedBuffer.length === receivedBuffer.length &&
+      crypto.timingSafeEqual(generatedBuffer, receivedBuffer);
+
+    if (!isValid) {
       return res.status(400).json({
         success: false,
         message: "Payment verification failed"
@@ -181,7 +189,7 @@ export const verifyPayment = async (req, res) => {
 export const getOrders = async (req, res) => {
   try {
     const { deviceId, sessionToken } = req.cookies || {};
-    
+
     let user = await UserModel.findOne({
       $or: [
         { deviceId, isGuest: true },
@@ -222,7 +230,7 @@ export const getOrderDetails = async (req, res) => {
   try {
     const { orderId } = req.params;
     const { deviceId, sessionToken } = req.cookies || {};
-    
+
     let user = await UserModel.findOne({
       $or: [
         { deviceId, isGuest: true },
@@ -274,7 +282,7 @@ async function updateStockAndClearCart(user) {
       { $inc: { stock: -item.quantity } }
     );
   }
-  
+
   user.cart = [];
   await user.save();
 }
