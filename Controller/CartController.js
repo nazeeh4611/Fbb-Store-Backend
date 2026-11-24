@@ -1,990 +1,396 @@
+import mongoose from "mongoose";
 import UserModel from "../Model/UserModel.js";
 import ProductModel from "../Model/ProductModel.js";
-import OrderModel from "../Model/OrderModel.js";
-import mongoose from "mongoose";
-import crypto from "crypto";
+import { getUnitPriceINR, getLineShipping, computeTotals } from "../Utils/pricing.js";
+
+const CART_PRODUCT_FIELDS =
+  "name brand priceINR priceAED images stock colors sizes active deleted seller shippingInfo discount";
+
+const CART_POPULATE = {
+  path: "cart.product",
+  select: CART_PRODUCT_FIELDS,
+  populate: { path: "seller", select: "name companyName phone email city state country" },
+};
+
+const WISHLIST_POPULATE = {
+  path: "wishlist.product",
+  select: "name brand priceINR priceAED images stock active deleted discount",
+};
+
+const isId = (id) => mongoose.Types.ObjectId.isValid(id);
+
+const toQuantity = (value, fallback = 1) => {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) ? n : fallback;
+};
 
 const getUser = async (req) => {
-  if (req.user && req.user._id) {
-    return await UserModel.findById(req.user._id);
-  }
-  
-  const { deviceId, sessionToken } = req.cookies || {};
-  
-  if (deviceId || sessionToken) {
-    let user = await UserModel.findOne({
-      $or: [
-        { deviceId, isGuest: true },
-        { sessionToken }
-      ]
-    });
+  const user = await UserModel.findById(req.user._id);
+  if (!user) throw Object.assign(new Error("User not found"), { status: 401 });
+  return user;
+};
 
-    if (!user) {
-      user = new UserModel({
-        deviceId,
-        sessionToken,
-        isGuest: true,
-        preferences: {
-          region: 'IN',
-          currency: 'INR',
-          notifications: {
-            email: false,
-            whatsapp: false,
-            sms: false
-          }
-        }
-      });
-      await user.save();
+const isAvailable = (product) => product && product.active && !product.deleted;
+
+/**
+ * Populate the cart, drop products that no longer exist / are inactive,
+ * and refresh each line's price to the current (discounted) price.
+ */
+const loadCart = async (user) => {
+  await user.populate(CART_POPULATE);
+  let changed = false;
+
+  const valid = user.cart.filter((item) => isAvailable(item.product));
+  if (valid.length !== user.cart.length) {
+    user.cart = valid;
+    changed = true;
+  }
+
+  for (const item of user.cart) {
+    const current = getUnitPriceINR(item.product);
+    if (item.price !== current) {
+      item.price = current;
+      changed = true;
     }
-
-    return user;
   }
 
-  throw new Error("User not found");
+  if (changed) {
+    await user.save();
+    await user.populate(CART_POPULATE);
+  }
+  return user.cart;
 };
 
-const calculateCartTotals = (cart) => {
-  const cartCount = cart.reduce((total, item) => total + item.quantity, 0);
-  const cartTotal = cart.reduce((total, item) => total + (item.price * item.quantity), 0);
-  return { cartCount, cartTotal };
+const buildSummary = (cart) => {
+  const totals = computeTotals(cart);
+  const bySeller = new Map();
+
+  for (const item of cart) {
+    const seller = item.product.seller;
+    const sellerId = (seller?._id || seller || "unknown").toString();
+    if (!bySeller.has(sellerId)) {
+      bySeller.set(sellerId, { seller, items: [], subtotal: 0, shipping: 0, itemsCount: 0 });
+    }
+    const group = bySeller.get(sellerId);
+    group.items.push({
+      id: item._id,
+      productId: item.product._id,
+      name: item.product.name,
+      brand: item.product.brand,
+      quantity: item.quantity,
+      price: item.price,
+      image: item.product.images?.image1,
+      images: item.product.images,
+      stock: item.product.stock,
+      selectedColor: item.selectedColor,
+      selectedSize: item.selectedSize,
+    });
+    group.subtotal += item.price * item.quantity;
+    group.shipping += getLineShipping(item.product);
+    group.itemsCount += item.quantity;
+  }
+
+  return {
+    ...totals,
+    sellers: Array.from(bySeller.values()),
+  };
 };
+
+const cartResponse = (cart, message) => {
+  const summary = buildSummary(cart);
+  return {
+    success: true,
+    ...(message ? { message } : {}),
+    cart,
+    cartCount: summary.items,
+    cartTotal: summary.subtotal,
+    summary,
+  };
+};
+
+const fail = (res, error, fallback) => {
+  if (error.status) return res.status(error.status).json({ success: false, message: error.message });
+  console.error(fallback, error);
+  return res.status(500).json({ success: false, message: fallback });
+};
+
+/* ------------------------------------------------------------------ cart */
 
 export const addToCart = async (req, res) => {
   try {
-    const { productId, quantity = 1, color, size } = req.body;
+    const { productId, color, size } = req.body;
+    const quantity = toQuantity(req.body.quantity, 1);
 
-    if (!productId) {
-      return res.status(400).json({
-        success: false,
-        message: "Product ID is required"
-      });
+    if (!productId || !isId(productId)) {
+      return res.status(400).json({ success: false, message: "A valid product is required" });
+    }
+    if (quantity < 1 || quantity > 100) {
+      return res.status(400).json({ success: false, message: "Quantity must be between 1 and 100" });
     }
 
-    const product = await ProductModel.findById(productId).populate('seller');
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: "Product not found"
-      });
+    const product = await ProductModel.findById(productId).select(CART_PRODUCT_FIELDS);
+    if (!isAvailable(product)) {
+      return res.status(404).json({ success: false, message: "Product not available" });
     }
-
-    if (product.stock < quantity) {
-      return res.status(400).json({
-        success: false,
-        message: "Insufficient stock available",
-        availableStock: product.stock
-      });
+    if (product.colors?.length && color && !product.colors.includes(color)) {
+      return res.status(400).json({ success: false, message: "Selected color is not available" });
+    }
+    if (product.sizes?.length && size && !product.sizes.includes(size)) {
+      return res.status(400).json({ success: false, message: "Selected size is not available" });
     }
 
     const user = await getUser(req);
-
-    const existingItemIndex = user.cart.findIndex(item => 
-      item.product.toString() === productId &&
-      item.selectedColor === color &&
-      item.selectedSize === size
+    const existing = user.cart.find(
+      (item) =>
+        item.product.toString() === productId &&
+        (item.selectedColor || "") === (color || "") &&
+        (item.selectedSize || "") === (size || "")
     );
 
-    if (existingItemIndex > -1) {
-      const newQuantity = user.cart[existingItemIndex].quantity + quantity;
-      
-      if (product.stock < newQuantity) {
-        return res.status(400).json({
-          success: false,
-          message: "Cannot add more items. Stock limit reached",
-          availableStock: product.stock
-        });
-      }
+    const newQuantity = (existing?.quantity || 0) + quantity;
+    if (product.stock < newQuantity) {
+      return res.status(400).json({
+        success: false,
+        message: product.stock > 0 ? `Only ${product.stock} left in stock` : "This product is out of stock",
+        availableStock: product.stock,
+      });
+    }
 
-      user.cart[existingItemIndex].quantity = newQuantity;
+    if (existing) {
+      existing.quantity = newQuantity;
+      existing.price = getUnitPriceINR(product);
     } else {
       user.cart.push({
         product: productId,
         quantity,
-        selectedColor: color,
-        selectedSize: size,
-        price: product.priceINR,
-        seller: product.seller._id
+        selectedColor: color || undefined,
+        selectedSize: size || undefined,
+        price: getUnitPriceINR(product),
       });
     }
 
     await user.save();
-
-    await user.populate({
-      path: 'cart.product',
-      select: 'name brand priceINR priceAED images stock colors sizes seller',
-      populate: {
-        path: 'seller',
-        select: 'name companyName'
-      }
-    });
-
-    const { cartCount, cartTotal } = calculateCartTotals(user.cart);
-
-    res.status(200).json({
-      success: true,
-      message: "Product added to cart",
-      cart: user.cart,
-      cartCount,
-      cartTotal
-    });
-
+    const cart = await loadCart(user);
+    res.status(200).json(cartResponse(cart, "Product added to cart"));
   } catch (error) {
-    console.error('Error adding to cart:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to add to cart",
-      error: error.message
-    });
+    fail(res, error, "Failed to add to cart");
   }
 };
 
 export const updateCartItem = async (req, res) => {
   try {
-    const { cartItemId, quantity } = req.body;
+    const { cartItemId } = req.body;
+    const quantity = toQuantity(req.body.quantity, NaN);
 
-    if (!cartItemId || !quantity || quantity < 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Valid cart item ID and quantity are required"
-      });
+    if (!cartItemId || !Number.isFinite(quantity) || quantity < 0 || quantity > 100) {
+      return res.status(400).json({ success: false, message: "Valid cart item and quantity are required" });
     }
 
     const user = await getUser(req);
-    
     const cartItem = user.cart.id(cartItemId);
     if (!cartItem) {
-      return res.status(404).json({
-        success: false,
-        message: "Cart item not found"
-      });
-    }
-
-    const product = await ProductModel.findById(cartItem.product);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: "Product not found"
-      });
+      return res.status(404).json({ success: false, message: "Cart item not found" });
     }
 
     if (quantity === 0) {
-      cartItem.remove();
+      cartItem.deleteOne();
     } else {
+      const product = await ProductModel.findById(cartItem.product).select("stock active deleted");
+      if (!isAvailable(product)) {
+        cartItem.deleteOne();
+        await user.save();
+        return res.status(404).json({ success: false, message: "Product is no longer available" });
+      }
       if (product.stock < quantity) {
         return res.status(400).json({
           success: false,
-          message: "Insufficient stock available",
-          availableStock: product.stock
+          message: `Only ${product.stock} left in stock`,
+          availableStock: product.stock,
         });
       }
       cartItem.quantity = quantity;
     }
 
     await user.save();
-    await user.populate({
-      path: 'cart.product',
-      select: 'name brand priceINR priceAED images stock colors sizes seller',
-      populate: {
-        path: 'seller',
-        select: 'name companyName'
-      }
-    });
-
-    const { cartCount, cartTotal } = calculateCartTotals(user.cart);
-
-    res.status(200).json({
-      success: true,
-      message: "Cart updated",
-      cart: user.cart,
-      cartCount,
-      cartTotal
-    });
-
+    const cart = await loadCart(user);
+    res.status(200).json(cartResponse(cart, "Cart updated"));
   } catch (error) {
-    console.error('Error updating cart:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to update cart",
-      error: error.message
-    });
+    fail(res, error, "Failed to update cart");
   }
 };
 
 export const removeFromCart = async (req, res) => {
   try {
     const { cartItemId } = req.params;
-
     const user = await getUser(req);
-    
+
     const cartItem = user.cart.id(cartItemId);
-    if (!cartItem) {
-      return res.status(404).json({
-        success: false,
-        message: "Cart item not found"
-      });
+    if (cartItem) {
+      cartItem.deleteOne();
+      await user.save();
     }
 
-    cartItem.remove();
-    await user.save();
-
-    await user.populate({
-      path: 'cart.product',
-      select: 'name brand priceINR priceAED images stock colors sizes seller',
-      populate: {
-        path: 'seller',
-        select: 'name companyName'
-      }
-    });
-
-    const { cartCount, cartTotal } = calculateCartTotals(user.cart);
-
-    res.status(200).json({
-      success: true,
-      message: "Item removed from cart",
-      cart: user.cart,
-      cartCount,
-      cartTotal
-    });
-
+    const cart = await loadCart(user);
+    res.status(200).json(cartResponse(cart, "Item removed from cart"));
   } catch (error) {
-    console.error('Error removing from cart:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to remove from cart",
-      error: error.message
-    });
+    fail(res, error, "Failed to remove from cart");
   }
 };
 
 export const clearCart = async (req, res) => {
   try {
-    const user = await getUser(req);
-    user.cart = [];
-    await user.save();
-
-    res.status(200).json({
-      success: true,
-      message: "Cart cleared",
-      cart: [],
-      cartCount: 0,
-      cartTotal: 0
-    });
-
+    await UserModel.updateOne({ _id: req.user._id }, { $set: { cart: [] } });
+    res.status(200).json(cartResponse([], "Cart cleared"));
   } catch (error) {
-    console.error('Error clearing cart:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to clear cart",
-      error: error.message
-    });
+    fail(res, error, "Failed to clear cart");
   }
 };
 
 export const getCart = async (req, res) => {
   try {
     const user = await getUser(req);
-
-    await user.populate({
-      path: 'cart.product',
-      select: 'name brand priceINR priceAED images stock colors sizes active seller shippingInfo',
-      populate: {
-        path: 'seller',
-        select: 'name companyName phone email address city state country pincode'
-      }
-    });
-
-    const activeCartItems = user.cart.filter(item => item.product && item.product.active);
-
-    if (activeCartItems.length !== user.cart.length) {
-      user.cart = activeCartItems;
-      await user.save();
-    }
-
-    const cartBySeller = {};
-    user.cart.forEach(item => {
-      const sellerId = item.product.seller._id.toString();
-      if (!cartBySeller[sellerId]) {
-        cartBySeller[sellerId] = {
-          seller: item.product.seller,
-          items: [],
-          subtotal: 0,
-          shipping: item.product.shippingInfo?.shippingCost || 0
-        };
-      }
-      cartBySeller[sellerId].items.push(item);
-      cartBySeller[sellerId].subtotal += item.price * item.quantity;
-    });
-
-    const { cartCount, cartTotal } = calculateCartTotals(user.cart);
-
-    res.status(200).json({
-      success: true,
-      cart: user.cart,
-      cartBySeller: Object.values(cartBySeller),
-      cartCount,
-      cartTotal
-    });
-
+    const cart = await loadCart(user);
+    const response = cartResponse(cart);
+    res.status(200).json({ ...response, cartBySeller: response.summary.sellers });
   } catch (error) {
-    console.error('Error getting cart:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to get cart",
-      error: error.message
-    });
+    fail(res, error, "Failed to get cart");
   }
 };
 
-export const getCartBySeller = async (req, res) => {
+export const getCartBySeller = getCart;
+
+export const getCartSummary = async (req, res) => {
   try {
     const user = await getUser(req);
-
-    await user.populate({
-      path: 'cart.product',
-      select: 'name brand priceINR priceAED images stock colors sizes active seller shippingInfo',
-      populate: {
-        path: 'seller',
-        select: 'name companyName phone email address city state country pincode'
-      }
-    });
-
-    const activeCartItems = user.cart.filter(item => item.product && item.product.active);
-
-    if (activeCartItems.length !== user.cart.length) {
-      user.cart = activeCartItems;
-      await user.save();
-    }
-
-    const cartBySeller = {};
-    user.cart.forEach(item => {
-      const sellerId = item.product.seller._id.toString();
-      if (!cartBySeller[sellerId]) {
-        cartBySeller[sellerId] = {
-          seller: item.product.seller,
-          items: [],
-          subtotal: 0,
-          shipping: item.product.shippingInfo?.shippingCost || 0,
-          itemsCount: 0
-        };
-      }
-      cartBySeller[sellerId].items.push({
-        id: item._id,
-        productId: item.product._id,
-        name: item.product.name,
-        brand: item.product.brand,
-        quantity: item.quantity,
-        price: item.price,
-        images: item.product.images,
-        stock: item.product.stock,
-        selectedColor: item.selectedColor,
-        selectedSize: item.selectedSize
-      });
-      cartBySeller[sellerId].subtotal += item.price * item.quantity;
-      cartBySeller[sellerId].itemsCount += item.quantity;
-    });
-
-    const { cartCount, cartTotal } = calculateCartTotals(user.cart);
-
-    const result = {
-      success: true,
-      cart: user.cart,
-      cartBySeller: Object.values(cartBySeller),
-      summary: {
-        items: cartCount,
-        subtotal: cartTotal,
-        shipping: Object.values(cartBySeller).reduce((sum, seller) => sum + seller.shipping, 0),
-        tax: Math.round(cartTotal * 0.18),
-        total: cartTotal + Object.values(cartBySeller).reduce((sum, seller) => sum + seller.shipping, 0) + Math.round(cartTotal * 0.18)
-      }
-    };
-
-    res.status(200).json(result);
-
+    const cart = await loadCart(user);
+    res.status(200).json({ success: true, summary: buildSummary(cart) });
   } catch (error) {
-    console.error('Error getting cart by seller:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to get cart by seller",
-      error: error.message
-    });
+    fail(res, error, "Failed to get cart summary");
   }
+};
+
+/* -------------------------------------------------------------- wishlist */
+
+const wishlistResponse = async (user, message) => {
+  await user.populate(WISHLIST_POPULATE);
+  const valid = user.wishlist.filter((w) => isAvailable(w.product));
+  if (valid.length !== user.wishlist.length) {
+    user.wishlist = valid;
+    await user.save();
+    await user.populate(WISHLIST_POPULATE);
+  }
+  return {
+    success: true,
+    ...(message ? { message } : {}),
+    wishlist: user.wishlist,
+    wishlistCount: user.wishlist.length,
+  };
 };
 
 export const addToWishlist = async (req, res) => {
   try {
     const { productId } = req.body;
-
-    if (!productId) {
-      return res.status(400).json({
-        success: false,
-        message: "Product ID is required"
-      });
+    if (!productId || !isId(productId)) {
+      return res.status(400).json({ success: false, message: "A valid product is required" });
     }
 
-    const product = await ProductModel.findById(productId);
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: "Product not found"
-      });
+    const product = await ProductModel.findById(productId).select("active deleted");
+    if (!isAvailable(product)) {
+      return res.status(404).json({ success: false, message: "Product not available" });
     }
 
     const user = await getUser(req);
-
-    const alreadyInWishlist = user.wishlist.some(item => 
-      item.product.toString() === productId
-    );
-
-    if (alreadyInWishlist) {
-      return res.status(200).json({
-        success: true,
-        message: "Product already in wishlist",
-        wishlist: user.wishlist,
-        wishlistCount: user.wishlist.length
-      });
+    const already = user.wishlist.some((w) => w.product.toString() === productId);
+    if (!already) {
+      user.wishlist.push({ product: productId });
+      await user.save();
     }
 
-    user.wishlist.push({ product: productId });
-    await user.save();
-
-    await user.populate({
-      path: 'wishlist.product',
-      select: 'name brand priceINR priceAED images stock active'
-    });
-
-    res.status(200).json({
-      success: true,
-      message: "Product added to wishlist",
-      wishlist: user.wishlist,
-      wishlistCount: user.wishlist.length
-    });
-
+    res.status(200).json(await wishlistResponse(user, already ? "Product already in wishlist" : "Product added to wishlist"));
   } catch (error) {
-    console.error('Error adding to wishlist:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to add to wishlist",
-      error: error.message
-    });
+    fail(res, error, "Failed to add to wishlist");
   }
 };
 
 export const removeFromWishlist = async (req, res) => {
   try {
     const { productId } = req.params;
-
     const user = await getUser(req);
 
-    const wishlistIndex = user.wishlist.findIndex(item => 
-      item.product.toString() === productId
-    );
+    const before = user.wishlist.length;
+    user.wishlist = user.wishlist.filter((w) => w.product.toString() !== productId);
+    if (user.wishlist.length !== before) await user.save();
 
-    if (wishlistIndex === -1) {
-      return res.status(404).json({
-        success: false,
-        message: "Product not found in wishlist"
-      });
-    }
-
-    user.wishlist.splice(wishlistIndex, 1);
-    await user.save();
-
-    await user.populate({
-      path: 'wishlist.product',
-      select: 'name brand priceINR priceAED images stock active'
-    });
-
-    res.status(200).json({
-      success: true,
-      message: "Product removed from wishlist",
-      wishlist: user.wishlist,
-      wishlistCount: user.wishlist.length
-    });
-
+    res.status(200).json(await wishlistResponse(user, "Product removed from wishlist"));
   } catch (error) {
-    console.error('Error removing from wishlist:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to remove from wishlist",
-      error: error.message
-    });
+    fail(res, error, "Failed to remove from wishlist");
   }
 };
 
 export const getWishlist = async (req, res) => {
   try {
     const user = await getUser(req);
-
-    await user.populate({
-      path: 'wishlist.product',
-      select: 'name brand priceINR priceAED images stock active'
-    });
-
-    const activeWishlistItems = user.wishlist.filter(item => item.product && item.product.active);
-
-    if (activeWishlistItems.length !== user.wishlist.length) {
-      user.wishlist = activeWishlistItems;
-      await user.save();
-    }
-
-    res.status(200).json({
-      success: true,
-      wishlist: user.wishlist,
-      wishlistCount: user.wishlist.length
-    });
-
+    res.status(200).json(await wishlistResponse(user));
   } catch (error) {
-    console.error('Error getting wishlist:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to get wishlist",
-      error: error.message
-    });
+    fail(res, error, "Failed to get wishlist");
   }
 };
 
 export const moveToCart = async (req, res) => {
   try {
-    const { productId, quantity = 1, color, size } = req.body;
+    const { productId, color, size } = req.body;
+    const quantity = Math.max(1, toQuantity(req.body.quantity, 1));
 
-    if (!productId) {
-      return res.status(400).json({
-        success: false,
-        message: "Product ID is required"
-      });
+    if (!productId || !isId(productId)) {
+      return res.status(400).json({ success: false, message: "A valid product is required" });
+    }
+
+    const product = await ProductModel.findById(productId).select(CART_PRODUCT_FIELDS);
+    if (!isAvailable(product)) {
+      return res.status(404).json({ success: false, message: "Product not available" });
     }
 
     const user = await getUser(req);
+    // Default to the first variant when moving from the wishlist without a selection.
+    const selectedColor = color || product.colors?.[0] || undefined;
+    const selectedSize = size || product.sizes?.[0] || undefined;
 
-    const wishlistIndex = user.wishlist.findIndex(item => 
-      item.product.toString() === productId
+    const existing = user.cart.find(
+      (item) =>
+        item.product.toString() === productId &&
+        (item.selectedColor || "") === (selectedColor || "") &&
+        (item.selectedSize || "") === (selectedSize || "")
     );
-
-    if (wishlistIndex === -1) {
-      return res.status(404).json({
-        success: false,
-        message: "Product not found in wishlist"
-      });
-    }
-
-    const product = await ProductModel.findById(productId).populate('seller');
-    if (!product) {
-      return res.status(404).json({
-        success: false,
-        message: "Product not found"
-      });
-    }
-
-    if (product.stock < quantity) {
+    const newQuantity = (existing?.quantity || 0) + quantity;
+    if (product.stock < newQuantity) {
       return res.status(400).json({
         success: false,
-        message: "Insufficient stock available",
-        availableStock: product.stock
+        message: product.stock > 0 ? `Only ${product.stock} left in stock` : "This product is out of stock",
+        availableStock: product.stock,
       });
     }
 
-    const existingCartItemIndex = user.cart.findIndex(item => 
-      item.product.toString() === productId &&
-      item.selectedColor === color &&
-      item.selectedSize === size
-    );
-
-    if (existingCartItemIndex > -1) {
-      const newQuantity = user.cart[existingCartItemIndex].quantity + quantity;
-      
-      if (product.stock < newQuantity) {
-        return res.status(400).json({
-          success: false,
-          message: "Cannot add more items. Stock limit reached",
-          availableStock: product.stock
-        });
-      }
-
-      user.cart[existingCartItemIndex].quantity = newQuantity;
-    } else {
+    if (existing) existing.quantity = newQuantity;
+    else {
       user.cart.push({
         product: productId,
         quantity,
-        selectedColor: color,
-        selectedSize: size,
-        price: product.priceINR,
-        seller: product.seller._id
+        selectedColor,
+        selectedSize,
+        price: getUnitPriceINR(product),
       });
     }
-
-    user.wishlist.splice(wishlistIndex, 1);
-
+    user.wishlist = user.wishlist.filter((w) => w.product.toString() !== productId);
     await user.save();
 
-    await user.populate({
-      path: 'cart.product',
-      select: 'name brand priceINR priceAED images stock colors sizes seller',
-      populate: {
-        path: 'seller',
-        select: 'name companyName'
-      }
-    });
-
-    await user.populate({
-      path: 'wishlist.product',
-      select: 'name brand priceINR priceAED images stock'
-    });
-
-    const { cartCount, cartTotal } = calculateCartTotals(user.cart);
-
+    const cart = await loadCart(user);
+    const wishlist = await wishlistResponse(user);
     res.status(200).json({
-      success: true,
-      message: "Product moved to cart",
-      cart: user.cart,
-      wishlist: user.wishlist,
-      cartCount,
-      wishlistCount: user.wishlist.length,
-      cartTotal
+      ...cartResponse(cart, "Product moved to cart"),
+      wishlist: wishlist.wishlist,
+      wishlistCount: wishlist.wishlistCount,
     });
-
   } catch (error) {
-    console.error('Error moving to cart:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to move product to cart",
-      error: error.message
-    });
-  }
-};
-
-export const getCartSummary = async (req, res) => {
-  try {
-    const user = await getUser(req);
-
-    await user.populate({
-      path: 'cart.product',
-      select: 'name brand priceINR priceAED images stock active seller shippingInfo',
-      populate: {
-        path: 'seller',
-        select: 'name companyName'
-      }
-    });
-
-    const activeCartItems = user.cart.filter(item => item.product && item.product.active);
-
-    if (activeCartItems.length !== user.cart.length) {
-      user.cart = activeCartItems;
-      await user.save();
-    }
-
-    const cartBySeller = {};
-    let totalShipping = 0;
-    
-    user.cart.forEach(item => {
-      const sellerId = item.product.seller._id.toString();
-      if (!cartBySeller[sellerId]) {
-        cartBySeller[sellerId] = {
-          seller: item.product.seller,
-          items: [],
-          subtotal: 0,
-          shipping: item.product.shippingInfo?.shippingCost || 0
-        };
-        totalShipping += cartBySeller[sellerId].shipping;
-      }
-      cartBySeller[sellerId].items.push({
-        id: item._id,
-        productId: item.product._id,
-        name: item.product.name,
-        brand: item.product.brand,
-        quantity: item.quantity,
-        price: item.price,
-        image: item.product.images?.image1,
-        stock: item.product.stock,
-        selectedColor: item.selectedColor,
-        selectedSize: item.selectedSize
-      });
-      cartBySeller[sellerId].subtotal += item.price * item.quantity;
-    });
-
-    const { cartCount, cartTotal } = calculateCartTotals(user.cart);
-    
-    const tax = Math.round(cartTotal * 0.18);
-    const total = cartTotal + totalShipping + tax;
-
-    const cartSummary = {
-      items: cartCount,
-      subtotal: cartTotal,
-      shipping: totalShipping,
-      tax,
-      total,
-      sellers: Object.values(cartBySeller)
-    };
-
-    res.status(200).json({
-      success: true,
-      summary: cartSummary
-    });
-
-  } catch (error) {
-    console.error('Error getting cart summary:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to get cart summary",
-      error: error.message
-    });
-  }
-};
-
-export const createOrder = async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
-  try {
-    const { shippingAddress, billingAddress, paymentMethod, notes } = req.body;
-
-    const user = await getUser(req);
-    
-    await user.populate({
-      path: 'cart.product',
-      select: 'name brand priceINR priceAED images stock seller shippingInfo',
-      populate: {
-        path: 'seller',
-        select: 'name companyName email phone'
-      }
-    });
-
-    if (!user.cart || user.cart.length === 0) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(400).json({
-        success: false,
-        message: "Cart is empty"
-      });
-    }
-
-    const orderItems = [];
-    const sellerItemsMap = new Map();
-    let totalSubtotal = 0;
-    let totalShipping = 0;
-    let insufficientStockItems = [];
-
-    for (const cartItem of user.cart) {
-      const product = cartItem.product;
-      
-      if (!product || !product.active) {
-        insufficientStockItems.push({
-          product: product?.name || "Unknown",
-          reason: "Product not available"
-        });
-        continue;
-      }
-
-      if (product.stock < cartItem.quantity) {
-        insufficientStockItems.push({
-          product: product.name,
-          reason: `Only ${product.stock} items available`
-        });
-        continue;
-      }
-
-      const itemSubtotal = cartItem.price * cartItem.quantity;
-      const itemShipping = product.shippingInfo?.freeShipping ? 0 : (product.shippingInfo?.shippingCost || 0);
-      
-      const orderItem = {
-        product: product._id,
-        seller: product.seller._id,
-        quantity: cartItem.quantity,
-        price: cartItem.price,
-        selectedColor: cartItem.selectedColor,
-        selectedSize: cartItem.selectedSize,
-        itemStatus: "pending",
-        sellerStatus: "pending"
-      };
-
-      orderItems.push(orderItem);
-
-      if (!sellerItemsMap.has(product.seller._id.toString())) {
-        sellerItemsMap.set(product.seller._id.toString(), {
-          seller: product.seller._id,
-          items: [],
-          subtotal: 0,
-          shipping: 0,
-          tax: 0,
-          total: 0,
-          sellerStatus: "pending"
-        });
-      }
-
-      const sellerOrder = sellerItemsMap.get(product.seller._id.toString());
-      sellerOrder.items.push(orderItem);
-      sellerOrder.subtotal += itemSubtotal;
-      sellerOrder.shipping += itemShipping;
-
-      totalSubtotal += itemSubtotal;
-      totalShipping += itemShipping;
-
-      product.stock -= cartItem.quantity;
-      product.soldCount += cartItem.quantity;
-      await product.save({ session });
-    }
-
-    console.log(insufficientStockItems,"itmesss")
-    if (insufficientStockItems.length > 0) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(400).json({
-        success: false,
-        message: "Some items are not available",
-        unavailableItems: insufficientStockItems
-      });
-    }
-
-    const tax = Math.round(totalSubtotal * 0.18);
-    const total = totalSubtotal + totalShipping + tax;
-
-    sellerItemsMap.forEach(sellerOrder => {
-      sellerOrder.tax = Math.round(sellerOrder.subtotal * 0.18);
-      sellerOrder.total = sellerOrder.subtotal + sellerOrder.shipping + sellerOrder.tax;
-    });
-
-    const generateOrderId = () => {
-      return `ORD${Date.now()}${crypto.randomInt(1000, 9999)}`;
-    };
-
-    const order = new OrderModel({
-      orderId: generateOrderId(),
-      user: user._id,
-      items: orderItems,
-      sellerOrders: Array.from(sellerItemsMap.values()),
-      shippingAddress,
-      billingAddress: billingAddress || shippingAddress,
-      paymentMethod,
-      paymentStatus: paymentMethod === 'cod' ? 'pending' : 'pending',
-      subtotal: totalSubtotal,
-      shipping: totalShipping,
-      tax: tax,
-      total: total,
-      status: "pending",
-      notes
-    });
-
-    await order.save({ session });
-
-    user.cart = [];
-    user.orders.push(order._id);
-    await user.save({ session });
-
-    await session.commitTransaction();
-    session.endSession();
-
-    await order.populate([
-      {
-        path: 'items.product',
-        select: 'name brand images'
-      },
-      {
-        path: 'items.seller',
-        select: 'name email phone'
-      },
-      {
-        path: 'sellerOrders.seller',
-        select: 'name email phone'
-      }
-    ]);
-
-    if (paymentMethod === 'razorpay') {
-      const Razorpay = require('razorpay');
-      const razorpay = new Razorpay({
-        key_id: process.env.RAZORPAY_KEY_ID,
-        key_secret: process.env.RAZORPAY_KEY_SECRET
-      });
-
-      const razorpayOrder = await razorpay.orders.create({
-        amount: Math.round(total * 100),
-        currency: "INR",
-        receipt: order.orderId,
-        notes: {
-          orderId: order.orderId,
-          userId: user._id.toString()
-        }
-      });
-
-      order.razorpayOrderId = razorpayOrder.id;
-      await order.save();
-
-      res.status(200).json({
-        success: true,
-        message: "Order created successfully",
-        order: order,
-        razorpayOrder: razorpayOrder,
-        key_id: process.env.RAZORPAY_KEY_ID
-      });
-    } else {
-      res.status(200).json({
-        success: true,
-        message: "Order created successfully. Pay on delivery.",
-        order: order
-      });
-    }
-
-  } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
-    
-    console.error('Error creating order:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to create order",
-      error: error.message
-    });
-  }
-};
-
-export const verifyPayment = async (req, res) => {
-  try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, orderId } = req.body;
-    
-    const user = await getUser(req);
-
-    const crypto = require('crypto');
-    const body = razorpay_order_id + "|" + razorpay_payment_id;
-    const expectedSignature = crypto
-      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(body.toString())
-      .digest("hex");
-
-    if (expectedSignature === razorpay_signature) {
-      const order = await OrderModel.findOne({ 
-        orderId,
-        user: user._id 
-      });
-      
-      if (!order) {
-        return res.status(404).json({
-          success: false,
-          message: "Order not found"
-        });
-      }
-
-      order.paymentStatus = "completed";
-      order.razorpayPaymentId = razorpay_payment_id;
-      order.razorpaySignature = razorpay_signature;
-      order.status = "processing";
-      
-      await order.save();
-
-      res.status(200).json({
-        success: true,
-        message: "Payment verified successfully",
-        order: order
-      });
-    } else {
-      res.status(400).json({
-        success: false,
-        message: "Invalid payment signature"
-      });
-    }
-  } catch (error) {
-    console.error('Error verifying payment:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to verify payment",
-      error: error.message
-    });
+    fail(res, error, "Failed to move product to cart");
   }
 };

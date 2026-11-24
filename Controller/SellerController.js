@@ -4,11 +4,23 @@ import jwt from 'jsonwebtoken';
 import productModel from "../Model/ProductModel.js";
 import categoryModel from "../Model/CategoryModel.js";
 import OrderModel from "../Model/OrderModel.js";
+import { invalidateCache } from "../Utils/cache.js";
+import {
+  CONFIRMED_ORDER_FILTER,
+  restockItems,
+  refundIfPaid,
+  itemsRefundValue,
+  isInventoryCommitted,
+} from "../Utils/orderService.js";
+
+const signSellerToken = (seller) =>
+  jwt.sign({ userId: seller._id, role: "seller" }, process.env.JWT_SECRET, { expiresIn: "7d" });
 
 export const SignUp = async (req, res) => {
   try {
-    const { email, phone, password, name, companyName, address, city, state, country, pincode, gstNumber, panNumber } = req.body
+    const { phone, password, name, companyName, address, city, state, country, pincode, gstNumber, panNumber } = req.body
 
+    const email = String(req.body.email || "").trim().toLowerCase();
     if (!email || !phone || !password || !name) {
       return res.status(400).json({ message: "Name, email, phone and password are required" });
     }
@@ -48,11 +60,7 @@ export const SignUp = async (req, res) => {
 
     await seller.save()
 
-    const token = jwt.sign({ userId: seller._id }, process.env.JWT_SECRET, {
-      expiresIn: '7d',
-    });
-
-    res.status(201).json({ token });
+    res.status(201).json({ token: signSellerToken(seller) });
   } catch (error) {
     res.status(500).json({ message: "Internal server error" })
   }
@@ -66,8 +74,9 @@ export const login = async (req, res) => {
       return res.status(400).json({ message: "Email/Phone and password are required" });
     }
 
+    const identifier = String(emailOrPhone).trim();
     const seller = await SellerModel.findOne({
-      $or: [{ email: emailOrPhone }, { phone: emailOrPhone }],
+      $or: [{ email: identifier.toLowerCase() }, { phone: identifier }],
     });
 
     if (!seller) {
@@ -79,9 +88,7 @@ export const login = async (req, res) => {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
-    const token = jwt.sign({ userId: seller._id }, process.env.JWT_SECRET, {
-      expiresIn: '7d',
-    });
+    const token = signSellerToken(seller);
 
     return res.status(200).json({
       message: 'Login successful',
@@ -310,6 +317,7 @@ export const addProduct = async (req, res) => {
     await SellerModel.findByIdAndUpdate(product.seller, {
       $addToSet: { categories: productData.categoryId }
     });
+    invalidateCache();
 
     const populatedProduct = await productModel.findById(product._id)
       .populate('categoryId', 'name')
@@ -323,17 +331,15 @@ export const addProduct = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to add product",
-      error: error.message
+      message: "Failed to add product"
     });
   }
 };
 
 export const getProducts = async (req, res) => {
   try {
-    const seller = req.params.id
     const products = await productModel
-      .find({ seller: seller })
+      .find({ seller: req.user.userId, deleted: { $ne: true } })
       .populate('categoryId', 'name')
       .populate('subCategoryId', 'name')
       .sort({ createdAt: -1 });
@@ -342,8 +348,7 @@ export const getProducts = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to fetch products",
-      error: error.message
+      message: "Failed to fetch products"
     });
   }
 };
@@ -391,7 +396,6 @@ export const resetPassword = async (req, res) => {
 export const updateProduct = async (req, res) => {
   try {
 
-    console.log("Reach 3")
     const { id } = req.params;
     const sellerId = req.user?.userId;
 
@@ -429,6 +433,10 @@ export const updateProduct = async (req, res) => {
         success: false,
         message: "Valid price (INR) is required"
       });
+    }
+
+    if (sku && sku !== product.sku && (await productModel.exists({ sku, _id: { $ne: id } }))) {
+      return res.status(400).json({ success: false, message: "SKU already exists" });
     }
 
     let parsedExistingImages = {};
@@ -502,7 +510,7 @@ export const updateProduct = async (req, res) => {
     }
 
     const finalVideos = {};
-    for (let i = 1; i <= 2; i++) {
+    for (let i = 1; i <= 4; i++) {
       const fieldName = `video${i}`;
       const newVideo = newVideos[fieldName];
       const existingVideo = parsedExistingVideos[fieldName];
@@ -552,7 +560,7 @@ export const updateProduct = async (req, res) => {
       description: description || '',
       shortDescription: shortDescription || '',
       sku: sku || product.sku,
-      stock: stock && !isNaN(parseInt(stock)) ? parseInt(stock) : 0,
+      stock: stock !== undefined && stock !== '' && !isNaN(parseInt(stock)) ? Math.max(0, parseInt(stock)) : product.stock,
       lowStockThreshold: lowStockThreshold && !isNaN(parseInt(lowStockThreshold)) ? parseInt(lowStockThreshold) : 10,
       images: finalImages,
       videos: finalVideos,
@@ -630,6 +638,11 @@ export const updateProduct = async (req, res) => {
       .populate('subCategoryId')
       .populate('seller', 'name email');
 
+    if (categoryId) {
+      await SellerModel.findByIdAndUpdate(sellerId, { $addToSet: { categories: categoryId } });
+    }
+    invalidateCache();
+
     res.status(200).json({
       success: true,
       message: "Product updated successfully",
@@ -638,15 +651,13 @@ export const updateProduct = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to update product",
-      error: error.message
+      message: "Failed to update product"
     });
   }
 };
 
 export const updateProfile = async (req, res) => {
   try {
-    console.log("Reach 1")
     const sellerId = req.user?.userId;
     const { INR, DXB, name, phone, companyName, address, city, state, country, pincode, gstNumber, panNumber } = req.body;
 
@@ -680,6 +691,7 @@ export const updateProfile = async (req, res) => {
     if (!updatedSeller) {
       return res.status(404).json({ message: "Seller not found" });
     }
+    invalidateCache();
 
     res.status(200).json({
       success: true,
@@ -689,8 +701,7 @@ export const updateProfile = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Server error",
-      error: error.message
+      message: "Server error"
     });
   }
 };
@@ -716,7 +727,14 @@ export const deleteProduct = async (req, res) => {
       });
     }
 
-    await productModel.findByIdAndDelete(id);
+    // Keep products that appear in orders (soft delete) so order history stays intact.
+    const usedInOrders = await OrderModel.exists({ "items.product": product._id });
+    if (usedInOrders) {
+      await productModel.updateOne({ _id: id }, { $set: { deleted: true, active: false, sku: null } });
+    } else {
+      await productModel.findByIdAndDelete(id);
+    }
+    invalidateCache();
 
     res.status(200).json({
       success: true,
@@ -725,16 +743,14 @@ export const deleteProduct = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to delete product",
-      error: error.message
+      message: "Failed to delete product"
     });
   }
 }
 
 export const getSellerProfile = async (req, res) => {
   try {
-    const { id } = req.params;
-    const seller = await SellerModel.findById(id)
+    const seller = await SellerModel.findById(req.user.userId)
       .select('-password')
       .populate('categories', 'name');
 
@@ -752,8 +768,7 @@ export const getSellerProfile = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to fetch seller profile",
-      error: error.message
+      message: "Failed to fetch seller profile"
     });
   }
 };
@@ -770,7 +785,8 @@ export const getSellerOrders = async (req, res) => {
     }
 
     const orders = await OrderModel.find({
-      "sellerOrders.seller": sellerId
+      "sellerOrders.seller": sellerId,
+      ...CONFIRMED_ORDER_FILTER
     })
       .populate('user', 'name email phone address')
       .populate({
@@ -785,12 +801,13 @@ export const getSellerOrders = async (req, res) => {
       );
 
       return {
+        _id: order._id,
         orderId: order.orderId,
         createdAt: order.createdAt,
         orderDate: order.createdAt,
         user: order.user,
         items: order.items.filter(item =>
-          item.seller.toString() === sellerId.toString()
+          item.seller?.toString() === sellerId.toString()
         ),
         subtotal: sellerOrder?.subtotal || 0,
         shipping: sellerOrder?.shipping || 0,
@@ -824,8 +841,7 @@ export const getSellerOrders = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to get seller orders",
-      error: error.message
+      message: "Failed to get seller orders"
     });
   }
 };
@@ -864,6 +880,13 @@ export const updateOrderStatus = async (req, res) => {
       so.seller.toString() === sellerId.toString()
     );
 
+    if (order.paymentMethod === 'razorpay' && order.paymentStatus === 'pending') {
+      return res.status(400).json({ success: false, message: "This order has not been paid yet" });
+    }
+    if (['cancelled', 'delivered'].includes(sellerOrder?.sellerStatus) && sellerOrder.sellerStatus !== status) {
+      return res.status(400).json({ success: false, message: `Order is already ${sellerOrder.sellerStatus}` });
+    }
+
     if (!sellerOrder) {
       return res.status(403).json({
         success: false,
@@ -878,8 +901,10 @@ export const updateOrderStatus = async (req, res) => {
       sellerOrder.shippedAt = new Date();
     }
 
+    const newlyCancelled = [];
     order.items.forEach(item => {
       if (item.seller && item.seller.toString() === sellerId.toString()) {
+        if (status === 'cancelled' && item.itemStatus !== 'cancelled') newlyCancelled.push(item);
         if (status === 'shipped') {
           item.itemStatus = 'shipped';
           if (trackingNumber) {
@@ -892,6 +917,8 @@ export const updateOrderStatus = async (req, res) => {
           item.sellerStatus = 'processing';
         } else if (status === 'delivered') {
           item.itemStatus = 'delivered';
+          item.sellerStatus = 'delivered';
+          item.actualDeliveryDate = new Date();
         } else if (status === 'cancelled') {
           item.itemStatus = 'cancelled';
           item.sellerStatus = 'cancelled';
@@ -923,7 +950,21 @@ export const updateOrderStatus = async (req, res) => {
       }
     }
 
+    if (order.items.every(item => item.itemStatus === 'cancelled')) {
+      order.status = 'cancelled';
+    } else if (status === 'accepted' && order.status === 'pending') {
+      order.status = 'accepted';
+    } else if (status === 'processing' && ['pending', 'accepted'].includes(order.status)) {
+      order.status = 'processing';
+    }
+
     await order.save();
+
+    if (newlyCancelled.length) {
+      if (isInventoryCommitted(order)) await restockItems(newlyCancelled);
+      const amount = order.status === 'cancelled' ? order.total : itemsRefundValue(newlyCancelled);
+      await refundIfPaid(order, amount, { cancelledBy: 'seller' });
+    }
 
     const updatedOrder = await OrderModel.findOne({ orderId })
       .populate('user', 'name email phone')
@@ -937,8 +978,7 @@ export const updateOrderStatus = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to update order status",
-      error: error.message
+      message: "Failed to update order status"
     });
   }
 };
@@ -956,12 +996,14 @@ export const getSellerDashboardStats = async (req, res) => {
 
     const totalProducts = await productModel.countDocuments({
       seller: sellerId,
-      active: true
+      active: true,
+      deleted: { $ne: true }
     });
 
     const orders = await OrderModel.find({
-      "sellerOrders.seller": sellerId
-    });
+      "sellerOrders.seller": sellerId,
+      ...CONFIRMED_ORDER_FILTER
+    }).select('sellerOrders').lean();
 
     const totalOrders = orders.length;
 
@@ -974,12 +1016,12 @@ export const getSellerDashboardStats = async (req, res) => {
         so.seller.toString() === sellerId.toString()
       );
 
-      if (sellerOrder) {
+      if (sellerOrder && sellerOrder.sellerStatus !== 'cancelled') {
         totalRevenue += sellerOrder.total;
 
         if (sellerOrder.sellerStatus === 'completed' || sellerOrder.sellerStatus === 'delivered') {
           completedOrders++;
-        } else if (sellerOrder.sellerStatus === 'pending' || sellerOrder.sellerStatus === 'processing') {
+        } else if (['pending', 'accepted', 'processing'].includes(sellerOrder.sellerStatus)) {
           pendingOrders++;
         }
       }
@@ -1000,8 +1042,7 @@ export const getSellerDashboardStats = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to get dashboard stats",
-      error: error.message
+      message: "Failed to get dashboard stats"
     });
   }
 };

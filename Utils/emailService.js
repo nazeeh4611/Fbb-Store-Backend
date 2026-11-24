@@ -1,6 +1,22 @@
 import { Resend } from 'resend';
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+// Lazily created so a missing key disables email instead of crashing the server.
+let resendClient = null;
+const noKeyClient = {
+  emails: {
+    send: async () => ({ data: null, error: { message: 'RESEND_API_KEY is not configured' } }),
+  },
+};
+const getResend = () => {
+  if (resendClient) return resendClient;
+  if (!process.env.RESEND_API_KEY) {
+    console.warn('[email] RESEND_API_KEY missing - emails are disabled');
+    return noKeyClient;
+  }
+  resendClient = new Resend(process.env.RESEND_API_KEY);
+  return resendClient;
+};
+const resend = { emails: { send: (...args) => getResend().emails.send(...args) } };
 
 export const sendOtpEmail = async (email, otp) => {
   try {
@@ -36,7 +52,7 @@ export const sendOtpEmail = async (email, otp) => {
           </div>
           
           <p style="color: #888; font-size: 14px; text-align: center; margin-top: 20px;">
-            This OTP is valid for 5 minutes. Do not share it with anyone.
+            This OTP is valid for 10 minutes. Do not share it with anyone.
           </p>
           
           <div style="margin-top: 40px; padding-top: 20px; border-top: 1px solid #eee;">
@@ -70,7 +86,6 @@ export const sendOtpEmail = async (email, otp) => {
 
 export const sendOrderConfirmationEmail = async (email, order) => {
 
-    console.log(email,"emaiiiiiiiiiiiiiiiiii")
   try {
     const itemsHtml = order.items.map(item => `
       <tr style="border-bottom: 1px solid #eee;">
@@ -403,64 +418,31 @@ export const sendSellerNewOrderEmail = async (sellerEmail, order, sellerOrder) =
   }
 };
 
-export const sendPasswordResetEmail = async (email, resetToken) => {
+export const sendPasswordResetEmail = async (email, code) => {
   try {
-    const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`;
-    
     const { data, error } = await resend.emails.send({
       from: 'FBB Store Support <no-reply@flybuybrand.com>',
       to: email,
-      subject: 'Password Reset Request - FBB Store',
+      subject: 'Your FBB Store password reset code',
       html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 30px; background: #ffffff; border-radius: 15px; box-shadow: 0 5px 15px rgba(0,0,0,0.05);">
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 30px; background: #ffffff; border-radius: 15px;">
           <div style="text-align: center; margin-bottom: 30px;">
-            <h1 style="color: #333; margin-bottom: 10px;">FBB LuxStoreury</h1>
-            <p style="color: #666;">Password Reset Request</p>
+            <h1 style="color: #111; margin-bottom: 10px;">FBB Store</h1>
+            <p style="color: #666;">Password reset</p>
           </div>
-
-          <div style="margin-bottom: 30px;">
-            <p style="color: #555; line-height: 1.6;">
-              We received a request to reset your password. Click the button below to create a new password:
-            </p>
+          <p style="color: #555; line-height: 1.6;">
+            We received a request to reset your password. Enter this code to choose a new password:
+          </p>
+          <div style="text-align: center; margin: 32px 0;">
+            <span style="display: inline-block; font-size: 32px; letter-spacing: 10px; font-weight: bold; color: #111; background: #f5f5f4; padding: 16px 28px; border-radius: 12px;">${code}</span>
           </div>
-
-          <div style="text-align: center; margin: 40px 0;">
-            <a href="${resetLink}" 
-               style="display: inline-block; 
-                      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                      color: white; 
-                      padding: 14px 35px; 
-                      text-decoration: none; 
-                      border-radius: 25px; 
-                      font-weight: 500;
-                      font-size: 16px;">
-              Reset Your Password
-            </a>
-          </div>
-
-          <div style="margin-bottom: 30px;">
-            <p style="color: #888; font-size: 14px;">
-              Or copy and paste this link in your browser:<br>
-              <span style="color: #667eea; word-break: break-all;">${resetLink}</span>
-            </p>
-          </div>
-
-          <div style="margin-top: 40px; padding-top: 20px; border-top: 1px solid #eee;">
-            <p style="color: #666; font-size: 14px;">
-              If you didn't request a password reset, you can safely ignore this email. 
-              Your password will not be changed.
-            </p>
-            <p style="color: #999; font-size: 12px; margin-top: 20px;">
-              This link will expire in 1 hour for security reasons.
-            </p>
-          </div>
-
-          <div style="margin-top: 30px; text-align: center;">
-            <p style="color: #999; font-size: 12px;">
-              © ${new Date().getFullYear()} FBB Store. All rights reserved.<br>
-              This is an automated email, please do not reply.
-            </p>
-          </div>
+          <p style="color: #888; font-size: 14px;">This code expires in 10 minutes.</p>
+          <p style="color: #666; font-size: 14px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #eee;">
+            If you didn't request this, you can safely ignore this email. Your password will not change.
+          </p>
+          <p style="color: #999; font-size: 12px; text-align: center; margin-top: 30px;">
+            © ${new Date().getFullYear()} FBB Store. All rights reserved.
+          </p>
         </div>
       `
     });
@@ -469,8 +451,6 @@ export const sendPasswordResetEmail = async (email, resetToken) => {
       console.error('Resend API error:', error);
       return false;
     }
-
-    console.log('Password reset email sent successfully:', data);
     return true;
   } catch (error) {
     console.error('Error sending password reset email:', error);

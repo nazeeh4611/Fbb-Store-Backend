@@ -135,7 +135,9 @@ const ProductSchema = new mongoose.Schema({
   },
   videos: {
     video1: { type: String, default: '' },
-    video2: { type: String, default: '' }
+    video2: { type: String, default: '' },
+    video3: { type: String, default: '' },
+    video4: { type: String, default: '' }
   },
   subCategoryId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -158,6 +160,12 @@ const ProductSchema = new mongoose.Schema({
   active: {
     type: Boolean,
     default: true,
+    index: true
+  },
+  // Soft-deleted by the seller (kept so existing orders still show the product)
+  deleted: {
+    type: Boolean,
+    default: false,
     index: true
   },
   trending: {

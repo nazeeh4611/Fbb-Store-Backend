@@ -1,132 +1,129 @@
 import OrderModel from "../Model/OrderModel.js";
 import ProductModel from "../Model/ProductModel.js";
 import UserModel from "../Model/UserModel.js";
-import SellerModel from "../Model/SellerModel.js";
 import mongoose from "mongoose";
 import crypto from "crypto";
-import { sendOrderConfirmationEmail, sendSellerNewOrderEmail } from "../Utils/emailService.js";
-import Razorpay from "razorpay";
+import { getUnitPriceINR, getLineShipping, computeTax } from "../Utils/pricing.js";
+import {
+  getRazorpay,
+  finalizeOrder,
+  restockItems,
+  refundIfPaid,
+  itemsRefundValue,
+  isInventoryCommitted,
+  CONFIRMED_ORDER_FILTER,
+} from "../Utils/orderService.js";
 
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET
-});
+const generateOrderId = () => `ORD${Date.now()}${crypto.randomInt(1000, 9999)}`;
 
-const generateOrderId = () => {
-  return `ORD${Date.now()}${crypto.randomInt(1000, 9999)}`;
+const ADDRESS_FIELDS = ["name", "phone", "email", "street", "city", "state", "country", "pincode"];
+const cleanAddress = (addr) => {
+  if (!addr || typeof addr !== "object") return null;
+  const out = {};
+  for (const f of ADDRESS_FIELDS) {
+    if (addr[f] !== undefined && addr[f] !== null) out[f] = String(addr[f]).trim().slice(0, 300);
+  }
+  return out;
 };
+const REQUIRED_ADDRESS = ["name", "phone", "street", "city", "state", "pincode"];
 
 export const createOrder = async (req, res) => {
-  const session = await mongoose.startSession();
+  const { shippingAddress: rawShipping, billingAddress: rawBilling, paymentMethod, notes } = req.body;
 
+  if (!["razorpay", "cod"].includes(paymentMethod)) {
+    return res.status(400).json({ success: false, message: "Invalid payment method" });
+  }
+  const shippingAddress = cleanAddress(rawShipping);
+  const missing = REQUIRED_ADDRESS.filter((f) => !shippingAddress?.[f]);
+  if (missing.length) {
+    return res.status(400).json({ success: false, message: `Shipping address is missing: ${missing.join(", ")}` });
+  }
+  if (!/^[0-9+\-\s]{7,15}$/.test(shippingAddress.phone)) {
+    return res.status(400).json({ success: false, message: "Please enter a valid phone number" });
+  }
+  const billingAddress = cleanAddress(rawBilling) || shippingAddress;
+
+  const session = await mongoose.startSession();
   try {
     session.startTransaction();
 
     const userId = req.user._id;
-    const { shippingAddress, billingAddress, paymentMethod, notes } = req.body;
-
     const user = await UserModel.findById(userId).session(session);
+    if (!shippingAddress.email && user.email) shippingAddress.email = user.email;
 
-    await user.populate({
-      path: 'cart.product',
-      select: 'name brand priceINR priceAED images stock seller shippingInfo',
-      populate: {
-        path: 'seller',
-        select: 'name companyName email phone'
-      }
-    });
-
-    if (user.cart.length === 0) {
+    if (!user.cart.length) {
       await session.abortTransaction();
-      session.endSession();
-      return res.status(400).json({
-        success: false,
-        message: "Cart is empty"
-      });
+      return res.status(400).json({ success: false, message: "Cart is empty" });
     }
 
     const orderItems = [];
     const sellerItemsMap = new Map();
-    let totalSubtotal = 0;
-    let totalShipping = 0;
-    const insufficientStockItems = [];
+    const unavailable = [];
+    let subtotal = 0;
+    let shipping = 0;
 
     for (const cartItem of user.cart) {
-      const product = await ProductModel.findById(cartItem.product._id).session(session);
+      const product = await ProductModel.findById(cartItem.product).session(session);
 
-      if (!product) {
-        insufficientStockItems.push({
-          product: cartItem.product?.name || "Unknown",
-          reason: "Product not available"
-        });
+      if (!product || !product.active || product.deleted) {
+        unavailable.push({ product: product?.name || "A product in your cart", reason: "No longer available" });
         continue;
       }
-
       if (product.stock < cartItem.quantity) {
-        insufficientStockItems.push({
+        unavailable.push({
           product: product.name,
-          reason: `Only ${product.stock} items available`
+          reason: product.stock > 0 ? `Only ${product.stock} left in stock` : "Out of stock",
         });
         continue;
       }
 
-      const itemSubtotal = cartItem.price * cartItem.quantity;
-      const itemShipping = product.shippingInfo?.freeShipping ? 0 : (product.shippingInfo?.shippingCost || 0);
+      // Always charge the CURRENT price (with any active discount), never the price saved in the cart.
+      const unitPrice = getUnitPriceINR(product);
+      const lineSubtotal = unitPrice * cartItem.quantity;
+      const lineShipping = getLineShipping(product);
 
       const orderItem = {
         product: product._id,
         seller: product.seller,
         quantity: cartItem.quantity,
-        price: cartItem.price,
+        price: unitPrice,
         selectedColor: cartItem.selectedColor,
         selectedSize: cartItem.selectedSize,
         itemStatus: "pending",
-        sellerStatus: "pending"
+        sellerStatus: "pending",
       };
-
       orderItems.push(orderItem);
 
       const sellerId = product.seller.toString();
       if (!sellerItemsMap.has(sellerId)) {
-        sellerItemsMap.set(sellerId, {
-          seller: product.seller,
-          items: [],
-          subtotal: 0,
-          shipping: 0,
-          tax: 0,
-          total: 0
-        });
+        sellerItemsMap.set(sellerId, { seller: product.seller, items: [], subtotal: 0, shipping: 0, tax: 0, total: 0 });
       }
-
       const sellerOrder = sellerItemsMap.get(sellerId);
       sellerOrder.items.push(orderItem);
-      sellerOrder.subtotal += itemSubtotal;
-      sellerOrder.shipping += itemShipping;
+      sellerOrder.subtotal += lineSubtotal;
+      sellerOrder.shipping += lineShipping;
 
-      totalSubtotal += itemSubtotal;
-      totalShipping += itemShipping;
-
-      product.stock -= cartItem.quantity;
-      product.soldCount = (product.soldCount || 0) + cartItem.quantity;
-      await product.save({ session });
+      subtotal += lineSubtotal;
+      shipping += lineShipping;
     }
 
-    if (insufficientStockItems.length > 0) {
+    if (unavailable.length) {
       await session.abortTransaction();
-      session.endSession();
       return res.status(400).json({
         success: false,
-        message: "Some items are not available",
-        unavailableItems: insufficientStockItems
+        message: `Some items are unavailable: ${unavailable.map((u) => `${u.product} (${u.reason})`).join(", ")}`,
+        unavailableItems: unavailable,
       });
     }
 
-    const tax = Math.round(totalSubtotal * 0.18);
-    const total = totalSubtotal + totalShipping + tax;
+    subtotal = Math.round(subtotal * 100) / 100;
+    const tax = computeTax(subtotal);
+    const total = Math.round((subtotal + shipping + tax) * 100) / 100;
 
-    sellerItemsMap.forEach(sellerOrder => {
-      sellerOrder.tax = Math.round(sellerOrder.subtotal * 0.18);
-      sellerOrder.total = sellerOrder.subtotal + sellerOrder.shipping + sellerOrder.tax;
+    sellerItemsMap.forEach((so) => {
+      so.subtotal = Math.round(so.subtotal * 100) / 100;
+      so.tax = computeTax(so.subtotal);
+      so.total = Math.round((so.subtotal + so.shipping + so.tax) * 100) / 100;
     });
 
     const order = new OrderModel({
@@ -135,107 +132,79 @@ export const createOrder = async (req, res) => {
       items: orderItems,
       sellerOrders: Array.from(sellerItemsMap.values()),
       shippingAddress,
-      billingAddress: billingAddress || shippingAddress,
+      billingAddress,
       paymentMethod,
-      paymentStatus: 'pending',
-      subtotal: totalSubtotal,
-      shipping: totalShipping,
+      paymentStatus: "pending",
+      subtotal,
+      shipping,
       tax,
       total,
       status: "pending",
-      notes
+      notes: typeof notes === "string" ? notes.slice(0, 500) : undefined,
+      inventoryCommitted: false,
     });
 
-    await order.save({ session });
-
-    user.cart = [];
-    user.orders.push(order._id);
-    await user.save({ session });
-
-    await session.commitTransaction();
-    session.endSession();
-
-    await order.populate([
-      { path: 'items.product', select: 'name brand images' },
-      { path: 'items.seller', select: 'name email phone' },
-      { path: 'sellerOrders.seller', select: 'name email phone' }
-    ]);
-
-    sendOrderConfirmationEmail(user.email, order)
-      .catch(err => console.error("Order email failed:", err.message));
-
-    sellerItemsMap.forEach(async (sellerOrder, sellerId) => {
-      try {
-        const seller = await SellerModel.findById(sellerId);
-        if (seller?.email) {
-          await sendSellerNewOrderEmail(seller.email, order, sellerOrder);
-        }
-      } catch (err) {
-        console.error("Seller email failed:", err.message);
-      }
-    });
-
-    if (paymentMethod === 'razorpay') {
-      const razorpayOrder = await razorpay.orders.create({
+    // Create the Razorpay order BEFORE committing so a gateway failure leaves nothing behind.
+    let razorpayOrder = null;
+    if (paymentMethod === "razorpay") {
+      razorpayOrder = await getRazorpay().orders.create({
         amount: Math.round(total * 100),
         currency: "INR",
         receipt: order.orderId,
-        notes: {
-          orderId: order.orderId,
-          userId: userId.toString()
-        }
+        notes: { orderId: order.orderId, userId: userId.toString() },
       });
-
       order.razorpayOrderId = razorpayOrder.id;
-      await order.save();
-
-      return res.status(200).json({
-        success: true,
-        message: "Order created successfully",
-        order,
-        razorpayOrder,
-        key_id: process.env.RAZORPAY_KEY_ID
-      });
     }
+
+    await order.save({ session });
+    await session.commitTransaction();
+
+    // COD orders are confirmed immediately; online orders are finalized after payment.
+    if (paymentMethod === "cod") {
+      await finalizeOrder(order._id);
+    }
+
+    await order.populate([
+      { path: "items.product", select: "name brand images" },
+      { path: "items.seller", select: "name" },
+    ]);
 
     return res.status(200).json({
       success: true,
-      message: "Order created successfully. Pay on delivery.",
-      order
+      message: paymentMethod === "cod" ? "Order placed successfully. Pay on delivery." : "Order created successfully",
+      order,
+      razorpayOrder,
+      key_id: paymentMethod === "razorpay" ? process.env.RAZORPAY_KEY_ID : undefined,
     });
-
   } catch (error) {
-    if (session.inTransaction()) {
-      await session.abortTransaction();
-    }
-    session.endSession();
-
+    if (session.inTransaction()) await session.abortTransaction();
     console.error("Error creating order:", error);
-
-    return res.status(500).json({
+    return res.status(error.status || 500).json({
       success: false,
-      message: "Failed to create order",
-      error: error.message
+      message: error.status ? error.message : "Failed to create order. Please try again.",
     });
+  } finally {
+    session.endSession();
   }
 };
 
 export const verifyPayment = async (req, res) => {
   try {
-    const {
-      razorpay_order_id,
-      razorpay_payment_id,
-      razorpay_signature,
-      orderId
-    } = req.body;
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, orderId } = req.body;
 
-    const order = await OrderModel.findOne({ orderId });
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !orderId) {
+      return res.status(400).json({ success: false, message: "Missing payment details" });
+    }
 
+    const order = await OrderModel.findOne({ orderId, user: req.user._id });
     if (!order) {
-      return res.status(404).json({
-        success: false,
-        message: "Order not found"
-      });
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    // The signature must belong to THIS order's Razorpay order, otherwise a
+    // payment for a cheap order could be replayed against an expensive one.
+    if (order.razorpayOrderId !== razorpay_order_id) {
+      return res.status(400).json({ success: false, message: "Payment does not match this order" });
     }
 
     const generatedSignature = crypto
@@ -243,40 +212,26 @@ export const verifyPayment = async (req, res) => {
       .update(`${razorpay_order_id}|${razorpay_payment_id}`)
       .digest("hex");
 
-    const generatedBuffer = Buffer.from(generatedSignature);
-    const receivedBuffer = Buffer.from(razorpay_signature || "");
-
-    const isValid =
-      generatedBuffer.length === receivedBuffer.length &&
-      crypto.timingSafeEqual(generatedBuffer, receivedBuffer);
-
-    if (!isValid) {
-      return res.status(400).json({
-        success: false,
-        message: "Payment verification failed"
-      });
+    const a = Buffer.from(generatedSignature);
+    const b = Buffer.from(String(razorpay_signature));
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(400).json({ success: false, message: "Payment verification failed" });
     }
 
-    order.paymentStatus = "completed";
-    order.razorpayPaymentId = razorpay_payment_id;
-    order.razorpaySignature = razorpay_signature;
-    order.status = "processing";
+    if (order.paymentStatus !== "completed") {
+      order.paymentStatus = "completed";
+      order.razorpayPaymentId = razorpay_payment_id;
+      order.razorpaySignature = razorpay_signature;
+      if (order.status === "pending") order.status = "processing";
+      await order.save();
+    }
 
-    await order.save();
+    await finalizeOrder(order._id);
 
-    return res.status(200).json({
-      success: true,
-      message: "Payment verified successfully",
-      order
-    });
-
+    return res.status(200).json({ success: true, message: "Payment verified successfully", order });
   } catch (error) {
     console.error("Error verifying payment:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Payment verification failed",
-      error: error.message
-    });
+    return res.status(500).json({ success: false, message: "Payment verification failed" });
   }
 };
 
@@ -318,8 +273,7 @@ export const getOrder = async (req, res) => {
     console.error('Error getting order:', error);
     res.status(500).json({
       success: false,
-      message: "Failed to get order",
-      error: error.message
+      message: "Failed to get order"
     });
   }
 };
@@ -328,7 +282,7 @@ export const getUserOrders = async (req, res) => {
   try {
     const userId = req.user._id;
 
-    const orders = await OrderModel.find({ user: userId })
+    const orders = await OrderModel.find({ user: userId, ...CONFIRMED_ORDER_FILTER })
       .sort({ createdAt: -1 })
       .populate({
         path: 'items.product',
@@ -393,8 +347,7 @@ export const getUserOrders = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to get orders",
-      error: error.message
+      message: "Failed to get orders"
     });
   }
 };
@@ -432,11 +385,12 @@ export const getOrderDetails = async (req, res) => {
 
     const orderBySeller = {};
     order.sellerOrders.forEach(sellerOrder => {
-      const sellerId = sellerOrder.seller._id.toString();
+      const sellerId = (sellerOrder.seller?._id || sellerOrder.seller)?.toString();
+      if (!sellerId) return;
       orderBySeller[sellerId] = {
         seller: sellerOrder.seller,
-        items: order.items.filter(item => 
-          item.seller._id.toString() === sellerId
+        items: order.items.filter(item =>
+          (item.seller?._id || item.seller)?.toString() === sellerId
         ),
         subtotal: sellerOrder.subtotal,
         shipping: sellerOrder.shipping,
@@ -452,7 +406,7 @@ export const getOrderDetails = async (req, res) => {
       ...order.toObject(),
       items: order.items.map(item => ({
         ...item.toObject(),
-        canCancel: item.itemStatus === "pending",
+        canCancel: ["pending", "processing"].includes(item.itemStatus),
         canReturn: item.itemStatus === "delivered" && !item.returnStatus
       })),
       orderBySeller: Object.values(orderBySeller)
@@ -467,208 +421,98 @@ export const getOrderDetails = async (req, res) => {
     console.error('Error getting order details:', error);
     res.status(500).json({
       success: false,
-      message: "Failed to get order details",
-      error: error.message
+      message: "Failed to get order details"
     });
   }
 };
 
 export const cancelOrderItem = async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
   try {
     const { orderId } = req.params;
     const { itemId, reason } = req.body;
-    const userId = req.user._id;
 
-    const order = await OrderModel.findOne({ 
-      orderId,
-      user: userId 
-    }).session(session);
-
+    const order = await OrderModel.findOne({ orderId, user: req.user._id });
     if (!order) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(404).json({
-        success: false,
-        message: "Order not found"
-      });
+      return res.status(404).json({ success: false, message: "Order not found" });
     }
 
     const orderItem = order.items.id(itemId);
     if (!orderItem) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(404).json({
-        success: false,
-        message: "Order item not found"
-      });
+      return res.status(404).json({ success: false, message: "Order item not found" });
     }
-
-    if (!["pending", "processing"].includes(orderItem.itemStatus)) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(400).json({
-        success: false,
-        message: "Item cannot be cancelled at this stage"
-      });
-    }
-
-    const product = await ProductModel.findById(orderItem.product).session(session);
-    if (product) {
-      product.stock += orderItem.quantity;
-      product.soldCount -= orderItem.quantity;
-      await product.save({ session });
+    if (!["pending", "processing", "accepted"].includes(orderItem.itemStatus)) {
+      return res.status(400).json({ success: false, message: "Item cannot be cancelled at this stage" });
     }
 
     orderItem.itemStatus = "cancelled";
+    orderItem.sellerStatus = "cancelled";
     orderItem.cancellationReason = reason;
 
-    const allItemsCancelled = order.items.every(item => 
-      item.itemStatus === "cancelled"
-    );
-
-    if (allItemsCancelled) {
+    if (order.items.every((i) => i.itemStatus === "cancelled")) {
       order.status = "cancelled";
       order.cancellationReason = reason;
     }
+    await order.save();
 
-    const refundEligible = order.paymentMethod === 'razorpay' && order.paymentStatus === 'completed';
-    const refundAmount = refundEligible ? orderItem.price * orderItem.quantity : 0;
+    if (isInventoryCommitted(order)) await restockItems([orderItem]);
 
-    await order.save({ session });
-    await session.commitTransaction();
-    session.endSession();
-
-    if (refundEligible && order.razorpayPaymentId && refundAmount > 0) {
-      try {
-        await razorpay.payments.refund(order.razorpayPaymentId, {
-          amount: Math.round(refundAmount * 100),
-          speed: "normal",
-          notes: {
-            orderId: order.orderId,
-            itemId: itemId
-          }
-        });
-      } catch (refundError) {
-        console.error(`Refund initiation failed for order ${order.orderId}, item ${itemId}:`, refundError.message);
-      }
-    }
+    // Last item cancelled -> refund whatever is left (includes shipping); otherwise just this item.
+    const refundAmount = order.status === "cancelled" ? order.total : itemsRefundValue([orderItem]);
+    await refundIfPaid(order, refundAmount, { itemId: String(itemId) });
 
     await order.populate([
-      { path: 'items.product', select: 'name brand images' },
-      { path: 'items.seller', select: 'name companyName' }
+      { path: "items.product", select: "name brand images" },
+      { path: "items.seller", select: "name companyName" },
     ]);
 
-    res.status(200).json({
-      success: true,
-      message: "Item cancelled successfully",
-      order: order
-    });
-
+    res.status(200).json({ success: true, message: "Item cancelled successfully", order });
   } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
-
-    console.error('Error cancelling order item:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to cancel item",
-      error: error.message
-    });
+    console.error("Error cancelling order item:", error);
+    res.status(500).json({ success: false, message: "Failed to cancel item" });
   }
 };
 
 export const cancelOrder = async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-
   try {
     const { orderId } = req.params;
     const { reason } = req.body;
-    const userId = req.user._id;
 
-    const order = await OrderModel.findOne({ 
-      orderId,
-      user: userId 
-    }).session(session);
-
+    const order = await OrderModel.findOne({ orderId, user: req.user._id });
     if (!order) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(404).json({
-        success: false,
-        message: "Order not found"
-      });
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    if (!["pending", "processing", "accepted"].includes(order.status)) {
+      return res.status(400).json({ success: false, message: "Order cannot be cancelled at this stage" });
     }
 
-    if (!["pending", "processing"].includes(order.status)) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(400).json({
-        success: false,
-        message: "Order cannot be cancelled at this stage"
-      });
-    }
-
+    const cancelled = [];
     for (const item of order.items) {
-      if (item.itemStatus === "pending" || item.itemStatus === "processing") {
-        const product = await ProductModel.findById(item.product).session(session);
-        if (product) {
-          product.stock += item.quantity;
-          product.soldCount -= item.quantity;
-          await product.save({ session });
-        }
+      if (["pending", "processing", "accepted"].includes(item.itemStatus)) {
         item.itemStatus = "cancelled";
+        item.sellerStatus = "cancelled";
         item.cancellationReason = reason;
+        cancelled.push(item);
       }
     }
-
     order.status = "cancelled";
     order.cancellationReason = reason;
+    order.sellerOrders.forEach((so) => {
+      so.sellerStatus = "cancelled";
+    });
+    await order.save();
 
-    const refundEligible = order.paymentMethod === 'razorpay' && order.paymentStatus === 'completed';
-
-    await order.save({ session });
-    await session.commitTransaction();
-    session.endSession();
-
-    if (refundEligible && order.razorpayPaymentId) {
-      try {
-        await razorpay.payments.refund(order.razorpayPaymentId, {
-          amount: Math.round(order.total * 100),
-          speed: "normal",
-          notes: {
-            orderId: order.orderId
-          }
-        });
-      } catch (refundError) {
-        console.error(`Refund initiation failed for order ${order.orderId}:`, refundError.message);
-      }
-    }
+    if (isInventoryCommitted(order)) await restockItems(cancelled);
+    await refundIfPaid(order, order.total);
 
     await order.populate([
-      { path: 'items.product', select: 'name brand images' },
-      { path: 'items.seller', select: 'name companyName' }
+      { path: "items.product", select: "name brand images" },
+      { path: "items.seller", select: "name companyName" },
     ]);
 
-    res.status(200).json({
-      success: true,
-      message: "Order cancelled successfully",
-      order: order
-    });
-
+    res.status(200).json({ success: true, message: "Order cancelled successfully", order });
   } catch (error) {
-    await session.abortTransaction();
-    session.endSession();
-
-    console.error('Error cancelling order:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to cancel order",
-      error: error.message
-    });
+    console.error("Error cancelling order:", error);
+    res.status(500).json({ success: false, message: "Failed to cancel order" });
   }
 };
 
@@ -747,8 +591,7 @@ export const requestReturn = async (req, res) => {
     console.error('Error requesting return:', error);
     res.status(500).json({
       success: false,
-      message: "Failed to request return",
-      error: error.message
+      message: "Failed to request return"
     });
   }
 };
@@ -816,226 +659,103 @@ export const trackOrder = async (req, res) => {
     console.error('Error tracking order:', error);
     res.status(500).json({
       success: false,
-      message: "Failed to track order",
-      error: error.message
-    });
-  }
-};
-
-export const updateOrderStatus = async (req, res) => {
-  try {
-    const { orderId, itemId, status, trackingNumber, shippingProvider, sellerNotes } = req.body;
-    const sellerId = req.seller._id;
-
-    const order = await OrderModel.findOne({ orderId });
-
-    if (!order) {
-      return res.status(404).json({
-        success: false,
-        message: "Order not found"
-      });
-    }
-
-    const sellerOrder = order.sellerOrders.find(so => 
-      so.seller.toString() === sellerId.toString()
-    );
-
-    if (!sellerOrder) {
-      return res.status(403).json({
-        success: false,
-        message: "You are not authorized to update this order"
-      });
-    }
-
-    if (itemId) {
-      const orderItem = order.items.id(itemId);
-      if (orderItem && orderItem.seller.toString() === sellerId.toString()) {
-        orderItem.itemStatus = status;
-        orderItem.sellerStatus = status;
-
-        if (status === "shipped" && trackingNumber) {
-          orderItem.trackingNumber = trackingNumber;
-          orderItem.shippingProvider = shippingProvider;
-          orderItem.estimatedDeliveryDate = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-        }
-
-        if (status === "delivered") {
-          orderItem.actualDeliveryDate = new Date();
-        }
-
-        if (sellerNotes) {
-          orderItem.sellerNotes = sellerNotes;
-        }
-      }
-    } else {
-      sellerOrder.sellerStatus = status;
-      if (status === "shipped" && trackingNumber) {
-        sellerOrder.trackingNumber = trackingNumber;
-        sellerOrder.shippedAt = new Date();
-      }
-      if (sellerNotes) {
-        sellerOrder.sellerNotes = sellerNotes;
-      }
-    }
-
-    const allItemsShipped = order.items.every(item => 
-      item.itemStatus === "shipped" || item.itemStatus === "delivered" || item.itemStatus === "cancelled"
-    );
-
-    if (allItemsShipped) {
-      order.status = "shipped";
-    }
-
-    const allItemsDelivered = order.items.every(item => 
-      item.itemStatus === "delivered" || item.itemStatus === "cancelled"
-    );
-
-    if (allItemsDelivered) {
-      order.status = "delivered";
-    }
-
-    await order.save();
-
-    res.status(200).json({
-      success: true,
-      message: "Order status updated successfully",
-      order: order
-    });
-
-  } catch (error) {
-    console.error('Error updating order status:', error);
-    res.status(500).json({
-      success: false,
-      message: "Failed to update order status",
-      error: error.message
+      message: "Failed to track order"
     });
   }
 };
 
 export const getSalesReport = async (req, res) => {
   try {
-    const sellerId = req.seller._id
-    const { range } = req.query
+    const sellerId = req.seller._id;
+    const sellerIdStr = sellerId.toString();
+    const { range } = req.query;
 
-    let startDate = new Date()
-    let endDate = new Date()
+    const startDate = new Date();
+    const endDate = new Date();
+    if (range === "week") startDate.setDate(startDate.getDate() - 7);
+    else if (range === "quarter") startDate.setMonth(startDate.getMonth() - 3);
+    else if (range === "year") startDate.setFullYear(startDate.getFullYear() - 1);
+    else startDate.setMonth(startDate.getMonth() - 1);
+    startDate.setHours(0, 0, 0, 0);
+    endDate.setHours(23, 59, 59, 999);
 
-    if (range === 'week') {
-      startDate.setDate(startDate.getDate() - 7)
-    } else if (range === 'month') {
-      startDate.setMonth(startDate.getMonth() - 1)
-    } else if (range === 'quarter') {
-      startDate.setMonth(startDate.getMonth() - 3)
-    } else if (range === 'year') {
-      startDate.setFullYear(startDate.getFullYear() - 1)
-    } else {
-      startDate.setMonth(startDate.getMonth() - 1)
-    }
-
-    startDate.setHours(0, 0, 0, 0)
-    endDate.setHours(23, 59, 59, 999)
+    // Previous period of equal length, for the growth rate.
+    const periodMs = endDate - startDate;
+    const prevStart = new Date(startDate.getTime() - periodMs);
 
     const orders = await OrderModel.find({
-      createdAt: { $gte: startDate, $lte: endDate }
+      "items.seller": sellerId,
+      createdAt: { $gte: prevStart, $lte: endDate },
+      ...CONFIRMED_ORDER_FILTER,
     })
+      .select("items createdAt")
+      .populate({ path: "items.product", select: "categoryId", populate: { path: "categoryId", select: "name" } })
+      .lean();
 
-    let totalSales = 0
-    let totalOrders = 0
-    let totalProducts = 0
-    const salesMap = new Map()
-    const categoryMap = new Map()
+    let totalSales = 0;
+    let prevSales = 0;
+    let totalOrders = 0;
+    let totalProducts = 0;
+    const salesMap = new Map();
+    const categoryMap = new Map();
 
     for (const order of orders) {
-      let orderHasSellerItems = false
+      const inCurrent = order.createdAt >= startDate;
+      const mine = order.items.filter(
+        (i) => i.seller?.toString() === sellerIdStr && i.itemStatus !== "cancelled"
+      );
+      if (!mine.length) continue;
 
-      for (const item of order.items) {
-        let itemSellerId = item.seller
-        if (itemSellerId && itemSellerId.toString() === sellerId.toString()) {
-          orderHasSellerItems = true
-          const itemTotal = item.price * item.quantity
-          totalSales += itemTotal
-          totalProducts += item.quantity
-
-          const dateStr = order.createdAt.toISOString().split('T')[0]
-          if (!salesMap.has(dateStr)) {
-            salesMap.set(dateStr, { sales: 0, orders: 0 })
-          }
-          const dayData = salesMap.get(dateStr)
-          dayData.sales += itemTotal
-
-          let categoryName = "Others"
-          try {
-            const product = await ProductModel.findById(item.product)
-            if (product && product.category) {
-              const category = await product.populate('category')
-              if (category.category) {
-                categoryName = category.category.name
-              }
-            }
-          } catch (err) {
-            console.log('Error fetching category:', err.message)
-          }
-
-          if (!categoryMap.has(categoryName)) {
-            categoryMap.set(categoryName, 0)
-          }
-          categoryMap.set(categoryName, categoryMap.get(categoryName) + itemTotal)
-        }
+      const orderSales = mine.reduce((sum, i) => sum + i.price * i.quantity, 0);
+      if (!inCurrent) {
+        prevSales += orderSales;
+        continue;
       }
 
-      if (orderHasSellerItems) {
-        totalOrders++
-        const dateStr = order.createdAt.toISOString().split('T')[0]
-        if (salesMap.has(dateStr)) {
-          const dayData = salesMap.get(dateStr)
-          dayData.orders += 1
-        }
+      totalOrders++;
+      totalSales += orderSales;
+      const dateStr = order.createdAt.toISOString().split("T")[0];
+      const day = salesMap.get(dateStr) || { sales: 0, orders: 0 };
+      day.sales += orderSales;
+      day.orders += 1;
+      salesMap.set(dateStr, day);
+
+      for (const item of mine) {
+        totalProducts += item.quantity;
+        const name = item.product?.categoryId?.name || "Others";
+        categoryMap.set(name, (categoryMap.get(name) || 0) + item.price * item.quantity);
       }
     }
 
     const salesData = Array.from(salesMap.entries())
-      .map(([date, data]) => ({
-        date,
-        sales: data.sales,
-        orders: data.orders
-      }))
-      .sort((a, b) => new Date(a.date) - new Date(b.date))
+      .map(([date, d]) => ({ date, sales: Number(d.sales.toFixed(2)), orders: d.orders }))
+      .sort((a, b) => a.date.localeCompare(b.date));
 
     const categoryData = Array.from(categoryMap.entries())
-      .map(([name, value]) => ({
-        name,
-        value: Number(value.toFixed(2))
-      }))
+      .map(([name, value]) => ({ name, value: Number(value.toFixed(2)) }))
       .sort((a, b) => b.value - a.value)
-      .slice(0, 5)
+      .slice(0, 5);
 
-    const avgOrderValue = totalOrders > 0 ? totalSales / totalOrders : 0
-    const growthRate = 0
-
-    const responseData = {
-      summary: {
-        totalSales: Number(totalSales.toFixed(2)),
-        totalOrders,
-        totalProducts,
-        avgOrderValue: Number(avgOrderValue.toFixed(2)),
-        growthRate
-      },
-      salesData,
-      categoryData,
-      monthlyTrends: []
-    }
+    const avgOrderValue = totalOrders > 0 ? totalSales / totalOrders : 0;
+    const growthRate = prevSales > 0 ? ((totalSales - prevSales) / prevSales) * 100 : totalSales > 0 ? 100 : 0;
 
     res.status(200).json({
       success: true,
-      data: responseData
-    })
-
+      data: {
+        summary: {
+          totalSales: Number(totalSales.toFixed(2)),
+          totalOrders,
+          totalProducts,
+          avgOrderValue: Number(avgOrderValue.toFixed(2)),
+          growthRate: Number(growthRate.toFixed(1)),
+        },
+        salesData,
+        categoryData,
+        monthlyTrends: [],
+      },
+    });
   } catch (error) {
-    console.error("Sales report error:", error)
-    res.status(500).json({
-      success: false,
-      message: "Failed to load sales report",
-      error: error.message
-    })
+    console.error("Sales report error:", error);
+    res.status(500).json({ success: false, message: "Failed to load sales report" });
   }
-}
+};

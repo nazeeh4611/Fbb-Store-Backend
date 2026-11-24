@@ -172,6 +172,15 @@ const OrderSchema = new mongoose.Schema(
       type: Number,
       default: 0
     },
+    // Amount we have asked Razorpay to refund (refundAmount is what Razorpay confirmed)
+    refundInitiatedAmount: {
+      type: Number,
+      default: 0
+    },
+    // false = stock not yet deducted (unpaid online order). Missing on legacy orders = already deducted.
+    inventoryCommitted: {
+      type: Boolean
+    },
     couponCode: String,
     discountAmount: {
       type: Number,
@@ -181,11 +190,12 @@ const OrderSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-OrderSchema.index({ orderId: 1 });
-OrderSchema.index({ user: 1 });
+OrderSchema.index({ user: 1, createdAt: -1 });
+OrderSchema.index({ razorpayOrderId: 1 }, { sparse: true });
 OrderSchema.index({ status: 1 });
 OrderSchema.index({ createdAt: -1 });
-OrderSchema.index({ "sellerOrders.seller": 1 });
+OrderSchema.index({ "sellerOrders.seller": 1, createdAt: -1 });
+OrderSchema.index({ "items.seller": 1, createdAt: -1 });
 OrderSchema.index({ "sellerOrders.sellerStatus": 1 });
 
 const OrderModel = mongoose.model("Order", OrderSchema);

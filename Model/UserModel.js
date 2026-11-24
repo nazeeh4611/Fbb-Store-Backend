@@ -41,6 +41,17 @@ const UserSchema = new mongoose.Schema(
       default: null
     },
 
+    otpAttempts: {
+      type: Number,
+      default: 0
+    },
+
+    // Purpose of the current OTP: "verify" (email verification) or "reset" (password reset)
+    otpPurpose: {
+      type: String,
+      default: null
+    },
+
     address: {
       shipping: {
         street: String,
@@ -143,15 +154,14 @@ const UserSchema = new mongoose.Schema(
     }
   },
   {
-    timestamps: true
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true }
   }
 );
 
 /* Indexes */
 UserSchema.index({ deviceId: 1, isGuest: 1 });
-UserSchema.index({ sessionToken: 1 });
-UserSchema.index({ email: 1 });
-UserSchema.index({ phone: 1 });
 
 /* Virtuals */
 UserSchema.virtual("cartTotal").get(function () {

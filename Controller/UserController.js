@@ -4,31 +4,23 @@ import SellerModel from "../Model/SellerModel.js";
 import subcategoryModel from "../Model/SubCategoryModel.js";
 import mongoose from "mongoose";
 
-const cache = new Map();
-const CACHE_DURATION = 5 * 60 * 1000;
+import { getFromCache, setToCache, invalidateCache } from "../Utils/cache.js";
 
-const getFromCache = (key) => {
-  const cached = cache.get(key);
-  if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
-    return cached.data;
-  }
-  return null;
+const escapeRegex = (str) => String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&").slice(0, 100);
+const toPage = (v) => Math.max(1, parseInt(v, 10) || 1);
+const toLimit = (v, def = 20) => Math.min(100, Math.max(1, parseInt(v, 10) || def));
+
+/** Ids of sellers an admin has approved. Products of other sellers are hidden from the store. */
+const getApprovedSellerIds = async () => {
+    const cached = getFromCache("approved-sellers");
+    if (cached) return cached;
+    const sellers = await SellerModel.find({ status: true }).select("_id").lean();
+    const ids = sellers.map((s) => s._id);
+    setToCache("approved-sellers", ids, 60 * 1000);
+    return ids;
 };
 
-const setToCache = (key, data) => {
-  cache.set(key, {
-    data,
-    timestamp: Date.now()
-  });
-};
-
-const clearCache = (keyPattern) => {
-  for (const key of cache.keys()) {
-    if (key.includes(keyPattern)) {
-      cache.delete(key);
-    }
-  }
-};
+const VISIBLE = { active: true, deleted: { $ne: true } };
 
 export const getProduct = async(req,res)=>{
     try {
@@ -42,22 +34,27 @@ export const getProduct = async(req,res)=>{
           trending = false 
         } = req.query;
         
-        const skip = (parseInt(page) - 1) * parseInt(limit);
-        
-        const cacheKey = `products:${page}:${limit}:${search}:${category}:${subcategory}:${seller}:${trending}`;
+        const pageNum = toPage(page);
+        const limitNum = toLimit(limit);
+        const skip = (pageNum - 1) * limitNum;
+
+        const cacheKey = `products:${pageNum}:${limitNum}:${search}:${category}:${subcategory}:${seller}:${trending}`;
         
         const cachedData = getFromCache(cacheKey);
         if (cachedData) {
           return res.status(200).json(cachedData);
         }
         
-        let query = { active: true };
-        
-        if (search) {
+        const approvedSellers = await getApprovedSellerIds();
+        let query = { ...VISIBLE, seller: { $in: approvedSellers } };
+
+        if (search && String(search).trim()) {
+            const rx = escapeRegex(String(search).trim());
             query.$or = [
-                { name: { $regex: search, $options: 'i' } },
-                { description: { $regex: search, $options: 'i' } },
-                { brand: { $regex: search, $options: 'i' } }
+                { name: { $regex: rx, $options: 'i' } },
+                { brand: { $regex: rx, $options: 'i' } },
+                { tags: { $regex: rx, $options: 'i' } },
+                { description: { $regex: rx, $options: 'i' } }
             ];
         }
         
@@ -70,7 +67,8 @@ export const getProduct = async(req,res)=>{
         }
         
         if (seller && mongoose.Types.ObjectId.isValid(seller)) {
-            query.seller = new mongoose.Types.ObjectId(seller);
+            const isApproved = approvedSellers.some((id) => id.toString() === seller);
+            query.seller = isApproved ? new mongoose.Types.ObjectId(seller) : { $in: [] };
         }
         
         if (trending === 'true') {
@@ -80,12 +78,12 @@ export const getProduct = async(req,res)=>{
         const total = await productModel.countDocuments(query);
         
         const products = await productModel.find(query)
-            .select('name brand priceINR priceAED description images categoryId seller trending createdAt')
+            .select('name brand priceINR priceAED shortDescription images categoryId subCategoryId seller trending featured stock discount colors sizes rating createdAt')
             .populate('categoryId', 'name')
-            .populate('seller', 'name image')
+            .populate('seller', 'name companyName profileImage')
             .sort({ createdAt: -1 })
             .skip(skip)
-            .limit(parseInt(limit))
+            .limit(limitNum)
             .lean();
         
         if(!products || products.length === 0){
@@ -93,7 +91,7 @@ export const getProduct = async(req,res)=>{
                 success: true,
                 products: [],
                 total: 0,
-                page: parseInt(page),
+                page: pageNum,
                 totalPages: 0
             });
         }
@@ -102,13 +100,13 @@ export const getProduct = async(req,res)=>{
             success: true,
             products,
             total,
-            page: parseInt(page),
-            limit: parseInt(limit),
-            totalPages: Math.ceil(total / parseInt(limit))
+            page: pageNum,
+            limit: limitNum,
+            totalPages: Math.ceil(total / limitNum)
         };
-        
+
         setToCache(cacheKey, response);
-        
+
         res.status(200).json(response);
     } catch (error) {
         console.error("Get product error:", error);
@@ -174,17 +172,14 @@ export const getCategory = async(req,res)=>{
 export const getSubCategories = async(req,res)=>{
     try {
         const { id } = req.params;
-        console.log("Fetching subcategories for category ID:", id);
         
         const cacheKey = `subcategories:${id}`;
         const cachedData = getFromCache(cacheKey);
         if (cachedData) {
-            console.log("Returning cached subcategories:", cachedData);
             return res.status(200).json(cachedData);
         }
 
         if (!mongoose.Types.ObjectId.isValid(id)) {
-            console.log("Invalid category ID format:", id);
             return res.status(200).json({ 
                 success: true,
                 subcategories: []
@@ -195,7 +190,6 @@ export const getSubCategories = async(req,res)=>{
             categoryId: id
         }).select('name image description').sort({ name: 1 }).lean();
 
-        console.log(`Found ${subcategories.length} subcategories for category ${id}:`, subcategories);
 
         const response = {
             success: true,
@@ -235,10 +229,10 @@ export const getDetails = async(req,res)=>{
             .select('-__v')
             .populate('subCategoryId', 'name image')
             .populate('categoryId', 'name')
-            .populate('seller', 'name image address INR DXB email')
+            .populate('seller', 'name companyName profileImage address city state INR DXB status')
             .lean();
 
-        if (!product) {
+        if (!product || !product.active || product.deleted || !product.seller?.status) {
             return res.status(404).json({ 
                 success: false,
                 message: "Product not found" 
@@ -289,6 +283,8 @@ export const getSubCategory = async (req, res) => {
                 $match: {
                     seller: sellerObjectId,
                     categoryId: categoryObjectId,
+                    active: true,
+                    deleted: { $ne: true },
                 }
             },
             {
@@ -361,6 +357,7 @@ export const ProductType = async(req,res)=>{
                 $match: {
                     subCategoryId: new mongoose.Types.ObjectId(id),
                     active: true,
+                    deleted: { $ne: true },
                     type: { $exists: true, $ne: "" }
                 }
             },
@@ -424,10 +421,10 @@ export const relatedProduct = async (req, res) => {
         const products = await productModel.find({ 
             subCategoryId: subCategoryObjectId,
             seller: sellerObjectId,
-            active: true 
+            ...VISIBLE
         })
-        .select('name brand priceINR priceAED images')
-        .populate("seller", "name image")
+        .select('name brand priceINR priceAED images stock discount')
+        .populate("seller", "name companyName")
         .limit(10)
         .sort({ createdAt: -1 })
         .lean();
@@ -458,7 +455,7 @@ export const getSellers = async(req,res)=>{
         }
 
         const sellers = await SellerModel.find({ status: true })
-            .select('name Image description address contact email categories createdAt')
+            .select('name companyName profileImage address city state country categories createdAt')
             .sort({ name: 1 })
             .lean();
 
@@ -482,18 +479,19 @@ export const getSellers = async(req,res)=>{
 export const getProductsByType = async(req,res)=>{
     try {
         const { type, subCategoryId, sellerId } = req.params;
-        const { page = 1, limit = 20 } = req.query;
-        const skip = (parseInt(page) - 1) * parseInt(limit);
-        
+        const page = toPage(req.query.page);
+        const limit = toLimit(req.query.limit);
+        const skip = (page - 1) * limit;
+
         const cacheKey = `products-type:${type}:${subCategoryId}:${sellerId}:${page}:${limit}`;
         const cachedData = getFromCache(cacheKey);
         if (cachedData) {
             return res.status(200).json(cachedData);
         }
         
-        let query = { 
-            active: true,
-            type: type 
+        let query = {
+            ...VISIBLE,
+            type: String(type)
         };
         
         if (mongoose.Types.ObjectId.isValid(subCategoryId)) {
@@ -507,7 +505,7 @@ export const getProductsByType = async(req,res)=>{
         const total = await productModel.countDocuments(query);
         const products = await productModel.find(query)
             .select('name brand priceINR priceAED images')
-            .populate('seller', 'name image')
+            .populate('seller', 'name companyName')
             .sort({ createdAt: -1 })
             .skip(skip)
             .limit(parseInt(limit))
@@ -517,9 +515,9 @@ export const getProductsByType = async(req,res)=>{
             success: true,
             products: products || [],
             total,
-            page: parseInt(page),
-            limit: parseInt(limit),
-            totalPages: Math.ceil(total / parseInt(limit))
+            page,
+            limit,
+            totalPages: Math.ceil(total / limit)
         };
         
         setToCache(cacheKey, response);
@@ -537,9 +535,10 @@ export const getProductsByType = async(req,res)=>{
 export const getProductsBySeller = async(req,res)=>{
     try {
         const { sellerId } = req.params;
-        const { page = 1, limit = 20 } = req.query;
-        const skip = (parseInt(page) - 1) * parseInt(limit);
-        
+        const page = toPage(req.query.page);
+        const limit = toLimit(req.query.limit);
+        const skip = (page - 1) * limit;
+
         const cacheKey = `products-seller:${sellerId}:${page}:${limit}`;
         const cachedData = getFromCache(cacheKey);
         if (cachedData) {
@@ -555,7 +554,7 @@ export const getProductsBySeller = async(req,res)=>{
         
         const query = { 
             seller: new mongoose.Types.ObjectId(sellerId),
-            active: true 
+            ...VISIBLE
         };
         
         const total = await productModel.countDocuments(query);
@@ -571,9 +570,9 @@ export const getProductsBySeller = async(req,res)=>{
             success: true,
             products: products || [],
             total,
-            page: parseInt(page),
-            limit: parseInt(limit),
-            totalPages: Math.ceil(total / parseInt(limit))
+            page,
+            limit,
+            totalPages: Math.ceil(total / limit)
         };
         
         setToCache(cacheKey, response);
@@ -591,8 +590,8 @@ export const getProductsBySeller = async(req,res)=>{
 export const clearCacheHandler = async (req, res) => {
     try {
         const { key } = req.query;
-        if (key === process.env.CACHE_CLEAR_KEY) {
-            clearCache('');
+        if (process.env.CACHE_CLEAR_KEY && key === process.env.CACHE_CLEAR_KEY) {
+            invalidateCache();
             res.status(200).json({ success: true, message: 'Cache cleared' });
         } else {
             res.status(401).json({ success: false, message: 'Unauthorized' });
@@ -652,22 +651,19 @@ export const getCategoriesWithSubcategories = async (req, res) => {
             return res.status(200).json(response);
         }
 
-        const categoriesWithSubcategories = await Promise.all(
-            categories.map(async (category) => {
-                const subcategories = await subcategoryModel.find({
-                    categoryId: category._id
-                })
-                .select('_id name image description')
-                .lean();
+        const allSubs = await subcategoryModel.find({
+            categoryId: { $in: categories.map((c) => c._id) }
+        })
+        .select('_id name image description categoryId')
+        .sort({ name: 1 })
+        .lean();
 
-                return {
-                    _id: category._id,
-                    name: category.name,
-                    image: category.image,
-                    subcategories: subcategories || []
-                };
-            })
-        );
+        const categoriesWithSubcategories = categories.map((category) => ({
+            _id: category._id,
+            name: category.name,
+            image: category.image,
+            subcategories: allSubs.filter((sub) => sub.categoryId?.toString() === category._id.toString())
+        }));
 
         const response = {
             success: true,

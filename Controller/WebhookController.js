@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import OrderModel from "../Model/OrderModel.js";
 import WebhookEventModel from "../Model/WebhookEventModel.js";
+import { finalizeOrder } from "../Utils/orderService.js";
 
 const SUPPORTED_EVENTS = new Set([
   "payment.captured",
@@ -38,17 +39,17 @@ const handlePaymentCaptured = async (payload) => {
     return;
   }
 
-  if (order.paymentStatus === "completed") {
-    console.log(`[webhook] order ${order.orderId} already completed, skipping`);
-    return;
+  if (order.paymentStatus !== "completed") {
+    order.paymentStatus = "completed";
+    order.razorpayPaymentId = paymentEntity.id;
+    if (order.status === "pending") {
+      order.status = "processing";
+    }
+    await order.save();
   }
 
-  order.paymentStatus = "completed";
-  order.razorpayPaymentId = paymentEntity.id;
-  if (order.status === "pending") {
-    order.status = "processing";
-  }
-  await order.save();
+  // Covers shoppers who closed the tab before the client-side verify call.
+  await finalizeOrder(order._id);
 
   console.log(`[webhook] order ${order.orderId} marked completed (payment.captured)`);
 };
@@ -82,15 +83,17 @@ const handleOrderPaid = async (payload) => {
     return;
   }
 
-  if (order.paymentStatus === "completed") {
-    return;
+  if (order.paymentStatus !== "completed") {
+    order.paymentStatus = "completed";
+    const paymentId = payload?.payment?.entity?.id;
+    if (paymentId && !order.razorpayPaymentId) order.razorpayPaymentId = paymentId;
+    if (order.status === "pending") {
+      order.status = "processing";
+    }
+    await order.save();
   }
 
-  order.paymentStatus = "completed";
-  if (order.status === "pending") {
-    order.status = "processing";
-  }
-  await order.save();
+  await finalizeOrder(order._id);
 
   console.log(`[webhook] order ${order.orderId} marked completed (order.paid)`);
 };
@@ -168,19 +171,25 @@ export const razorpayWebhook = async (req, res) => {
       throw err;
     }
 
-    switch (event) {
-      case "payment.captured":
-        await handlePaymentCaptured(payload);
-        break;
-      case "payment.failed":
-        await handlePaymentFailed(payload);
-        break;
-      case "order.paid":
-        await handleOrderPaid(payload);
-        break;
-      case "refund.processed":
-        await handleRefundProcessed(payload);
-        break;
+    try {
+      switch (event) {
+        case "payment.captured":
+          await handlePaymentCaptured(payload);
+          break;
+        case "payment.failed":
+          await handlePaymentFailed(payload);
+          break;
+        case "order.paid":
+          await handleOrderPaid(payload);
+          break;
+        case "refund.processed":
+          await handleRefundProcessed(payload);
+          break;
+      }
+    } catch (handlerError) {
+      // Forget the event so Razorpay's retry gets processed instead of skipped as a duplicate.
+      await WebhookEventModel.deleteOne({ eventId }).catch(() => {});
+      throw handlerError;
     }
 
     return res.status(200).json({ success: true, message: "Webhook processed" });
@@ -189,8 +198,7 @@ export const razorpayWebhook = async (req, res) => {
     console.error("[webhook] processing error:", error);
     return res.status(500).json({
       success: false,
-      message: "Webhook processing failed",
-      error: error.message
+      message: "Webhook processing failed"
     });
   }
 };
